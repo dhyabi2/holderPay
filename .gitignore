@@ -3,3 +3,4 @@ node_modules/
 .keys.json
 web/dist/
 data/
+.vercel/

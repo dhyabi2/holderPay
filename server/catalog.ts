@@ -24,6 +24,35 @@ export interface Listing {
 const DIR = path.resolve(process.cwd(), "data");
 const FILE = path.join(DIR, "catalog.json");
 
+/**
+ * A shop that cannot be changed at runtime.
+ *
+ * A serverless deployment has no writable disk and no shared one either: each
+ * invocation gets its own filesystem, so a "published" offer would exist for one
+ * request on one instance and then evaporate. Rather than pretend, such a
+ * deployment is seeded with the offers at build time and REFUSES writes, which
+ * loses nothing -- scripts/publish-offers.ts writes the catalog file directly,
+ * and shipping a new build is how a new offer reaches a static deployment.
+ */
+let frozen: Map<string, Listing> | null = null;
+
+export class CatalogReadOnlyError extends Error {
+  constructor() {
+    super(
+      "this deployment serves a fixed catalog -- publish with scripts/publish-offers.ts and redeploy, or run the Node server where the catalog is writable"
+    );
+  }
+}
+
+/** Seed a read-only catalog. Call before serving; ignores later writes. */
+export function seedReadOnly(listings: Listing[]): void {
+  frozen = new Map(listings.map((l) => [l.policy.id.toLowerCase(), l]));
+}
+
+export function isReadOnly(): boolean {
+  return frozen !== null;
+}
+
 let cache: Map<string, Listing> | null = null;
 // Re-read when the file changes underneath us. Scripts (publish-offers.ts) write
 // the same catalog while the server is running, and a server holding a snapshot
@@ -39,6 +68,7 @@ function mtime(): number {
 }
 
 function load(): Map<string, Listing> {
+  if (frozen) return frozen;
   const m = mtime();
   if (cache && m === cachedMtimeMs) return cache;
   cache = new Map();
@@ -70,6 +100,7 @@ export function get(policyId: string): Listing | null {
 }
 
 export function put(input: PolicyInput, unlock: string): Listing {
+  if (frozen) throw new CatalogReadOnlyError();
   const policy = makePolicy(input);
   const existing = load().get(policy.id);
   const listing: Listing = { policy, unlock, createdAt: existing?.createdAt ?? Date.now() };
@@ -79,6 +110,7 @@ export function put(input: PolicyInput, unlock: string): Listing {
 }
 
 export function remove(policyId: string): boolean {
+  if (frozen) throw new CatalogReadOnlyError();
   const ok = load().delete((policyId ?? "").toLowerCase());
   if (ok) save();
   return ok;

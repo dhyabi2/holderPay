@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>holderPay</title>
+<link rel="stylesheet" href="/pay.css" />
+</head>
+<body>
+<header class="bar">
+  <div class="brand">holder<span>Pay</span></div>
+  <span class="chip" id="wsChip" title="live connection"><i class="dot"></i><span id="tokenChip"></span></span>
+</header>
+
+<main>
+  <!-- the offer: title, price, and the buttons. Nothing else above the fold. -->
+  <section class="card">
+    <div class="card-head">
+      <h1 id="offerTitle">…</h1>
+      <button class="link" id="switchOffer" hidden>next</button>
+    </div>
+    <div class="price" id="offerPrice"></div>
+    <p class="muted small" id="offerDesc"></p>
+    <div class="pay-actions" id="payActions"></div>
+    <div class="status" id="status"></div>
+  </section>
+
+  <!-- what they bought -->
+  <section class="card" id="unlockCard" hidden>
+    <div class="unlock" id="unlock"></div>
+  </section>
+
+  <!-- the proof. Collapsed: a payer does not need it, an auditor does. -->
+  <details class="card fold" id="verdictCard" hidden>
+    <summary><span id="verdictBadge"></span></summary>
+    <div class="crosscheck" id="crosscheck"></div>
+    <div class="rows" id="verdictRows"></div>
+    <div class="row-actions">
+      <button class="ghost" id="recheck">re-check</button>
+      <button class="ghost danger" id="tamperBtn">tamper test</button>
+    </div>
+  </details>
+
+  <!-- wallet: the address to fund, and what is in it -->
+  <section class="card">
+    <div class="addr">
+      <code class="mono" id="walletAddr">…</code>
+      <button class="ghost" id="copyAddr">copy</button>
+    </div>
+    <div class="balances">
+      <b id="balXno">0</b><span class="muted small">XNO</span>
+      <b id="balTok">0</b><span class="muted small" id="balTokLabel">TEACHER</span>
+      <button class="ghost" id="receiveBtn">receive</button>
+      <button class="link" id="walletMenu">seed</button>
+    </div>
+  </section>
+
+  <details class="card fold">
+    <summary>Sell something</summary>
+    <div class="grid" id="cfgPanel">
+      <input id="cfgTitle" class="wide" placeholder="title" value="Nano 101 — full course" />
+      <input id="cfgDesc" class="wide" placeholder="description" value="Everything in the course, forever." />
+      <input id="cfgMerchant" class="wide mono" placeholder="merchant address" />
+      <input id="cfgResource" placeholder="resource id" value="course/nano-101" />
+      <input id="cfgSymbol" placeholder="symbols" value="TEACHER" />
+      <input id="cfgTokenId" class="wide mono" placeholder="token ids (32 hex, comma separated for several)" />
+      <input id="cfgPriceToken" placeholder="price in token" value="1" />
+      <input id="cfgPriceXno" placeholder="price in XNO (blank = none)" value="0.00001" />
+      <label class="check wide"><input type="checkbox" id="cfgAutoswap" checked /> settle in the token (auto-swap XNO)</label>
+      <textarea id="cfgUnlock" class="wide" rows="2" placeholder="what the buyer unlocks">Welcome to Nano 101. Your access is proven by a Nano block, not by our database.</textarea>
+      <button class="primary wide" id="cfgSave">publish</button>
+    </div>
+  </details>
+
+  <details class="card fold">
+    <summary>Log</summary>
+    <div class="log" id="log"></div>
+  </details>
+</main>
+
+<script type="module" src="/pay.js"></script>
+</body>
+</html>

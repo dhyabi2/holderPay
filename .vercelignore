@@ -1,0 +1,28 @@
+# What reaches Vercel is ONLY the built artefacts: api/[...path].js and public/.
+# Everything else is either a secret, a source that is already bundled into the
+# function, or a script that has no business on a public host.
+#
+# The most important lines are the first two. .env holds live mainnet seeds and
+# the RPC key; .keys.json holds derived key material. Neither is needed by the
+# deployment -- the server holds no signing key -- and both would be catastrophic
+# to upload. .gitignore already stops them reaching GitHub; this stops them
+# reaching the platform.
+.env
+.env.*
+.keys.json
+
+# Sources: already inside api/[...path].js, bundled and verified by
+# scripts/build-vercel.mjs. Shipping them again would only widen what is exposed.
+core/
+server/
+vendor/
+scripts/
+web/
+docs/
+data/
+node_modules/
+
+.git/
+.github/
+*.md
+package-lock.json

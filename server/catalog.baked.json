@@ -1,0 +1,49 @@
+{
+  "listings": [
+    {
+      "policy": {
+        "merchant": "nano_177uaf8ucnokskie7nt5maanp3pqwnmmh8qowoujxi6c48htzyc1zsrcgnxf",
+        "resource": "course/nano-101",
+        "title": "Nano 101 — the full course",
+        "description": "Pay in TEACHER, or pay in XNO and let the page swap it into TEACHER for the seller. Either way your access is proven by a block, not by our database.",
+        "accept": [
+          {
+            "tokenId": "cb9b91d6f52deb3541ae3988c42cb78b",
+            "symbol": "TEACHER",
+            "decimals": 6,
+            "price": "1000000"
+          }
+        ],
+        "priceXno": "10000000000000000000000000",
+        "autoswap": true,
+        "expires": 0,
+        "v": 2,
+        "id": "72d84cb8364784eac8db1c4f8a4c2640b03ec3426f2a4c010cc2a56f51a18b54"
+      },
+      "unlock": "Welcome to Nano 101.\n\nLesson 0: the reason you are reading this is not that a server decided you could. It is that two blocks exist on your own account chain -- a payment, and a receipt that commits to this exact offer -- and anyone can check them. Delete our database and your access survives; compromise our server and it still cannot be handed to someone who did not pay.",
+      "createdAt": 1789127222831
+    },
+    {
+      "policy": {
+        "merchant": "nano_177uaf8ucnokskie7nt5maanp3pqwnmmh8qowoujxi6c48htzyc1zsrcgnxf",
+        "resource": "seller/teacher-only",
+        "title": "TEACHER only — no XNO accepted",
+        "description": "This seller wants the token and nothing else. XNO payers are auto-swapped on the AMM inside their own wallet; the seller is paid in TEACHER.",
+        "accept": [
+          {
+            "tokenId": "cb9b91d6f52deb3541ae3988c42cb78b",
+            "symbol": "TEACHER",
+            "decimals": 6,
+            "price": "1000000"
+          }
+        ],
+        "autoswap": true,
+        "expires": 0,
+        "v": 2,
+        "id": "0b0bc56a205999a58b1f4b43900a2b04eab1151ceebf60b950e63fa980fe6e78"
+      },
+      "unlock": "Paid in TEACHER. The seller never touched XNO, and you never had to source the token in advance.",
+      "createdAt": 1789127222836
+    }
+  ]
+}

@@ -93,7 +93,11 @@ const ALLOWED_ACTIONS = new Set([
 // honest 429 that says how long to wait, rather than a request held forever.
 const WORK_PER_IP_PER_MIN = 12;
 const WORK_GLOBAL_PER_MIN = 120;
-const WORK_MAX_WAIT_MS = 75_000;
+// How long a request may be held waiting for a work slot. Tunable because the
+// ceiling is not ours: a serverless platform kills the invocation at its own
+// limit (60s on Vercel's default plan), and a request killed mid-hold is worse
+// than one told to come back -- so the serverless entry lowers this.
+const WORK_MAX_WAIT_MS = Number(env("WORK_MAX_WAIT_MS", "75000"));
 const WORK_MAX_WAITERS = 64;
 
 // Ledger reads are cheap per call and ruinous in aggregate: ~145 of them per
@@ -393,7 +397,15 @@ let inFlight = 0;
 let draining = false;
 let drained: (() => void) | null = null;
 
-const server = http.createServer(async (req, res) => {
+/**
+ * The whole HTTP surface, as one function.
+ *
+ * Exported because it has two homes: the Node server at the bottom of this
+ * file, and the serverless entry (server/vercel-entry.ts) that Vercel calls.
+ * Both run THIS code -- a deployment that diverged from the thing tested here
+ * would be a second implementation of the only route worth auditing.
+ */
+export async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   const ip = String(req.socket.remoteAddress ?? "?");
   const route = `${req.method} ${url.pathname}`;
@@ -497,6 +509,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (route === "POST /api/policies") {
+      // Say so before asking for credentials: a fixed deployment cannot accept
+      // this write from anybody, and "403 forbidden" would send an operator
+      // hunting for a token that would not have helped.
+      if (catalog.isReadOnly()) {
+        return json(res, 405, { error: new catalog.CatalogReadOnlyError().message });
+      }
       if (!adminOk(req)) {
         return json(res, 403, {
           error: "publishing offers is disabled -- set ADMIN_TOKEN in .env and send it as x-admin-token (or HOLDERPAY_DEV=1 for a local demo)",
@@ -705,7 +723,9 @@ const server = http.createServer(async (req, res) => {
     console.error(`[${ref}] ${route} failed:`, e);
     return json(res, 500, { error: "something went wrong on this server", ref });
   }
-});
+}
+
+const server = http.createServer(handle);
 
 /**
  * Content Security Policy for the page.
@@ -769,10 +789,6 @@ function serveFile(res: http.ServerResponse, file: string, type: string) {
   });
 }
 
-// Watch the merchant (and every merchant in the catalog) from the start, so a
-// payment made before anyone opens the page is still noticed immediately.
-watcher.watch([MERCHANT, ...catalog.list().map((l) => l.policy.merchant)].filter(Boolean));
-
 /**
  * Drain rather than cut.
  *
@@ -812,6 +828,18 @@ function finish(code: number): void {
   process.exit(code);
 }
 
+/**
+ * Everything below runs ONLY when this file is the process: a listening socket,
+ * a websocket subscription and signal handlers are all meaningless inside a
+ * serverless invocation, and starting them there would connect a socket per
+ * request. The flag is set at build time by scripts/build-vercel.mjs, so the
+ * decision is made once by the build rather than guessed at runtime.
+ */
+if (process.env.HOLDERPAY_SERVERLESS !== "1") {
+// Watch the merchant (and every merchant in the catalog) from the start, so a
+// payment made before anyone opens the page is still noticed immediately.
+watcher.watch([MERCHANT, ...catalog.list().map((l) => l.policy.merchant)].filter(Boolean));
+
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
@@ -824,3 +852,4 @@ server.listen(PORT, HOST, () => {
   console.log(`  token     ${TOKEN_ID || "(not launched yet -- run scripts/launch-token.ts)"}`);
   console.log(`  merchant  ${MERCHANT}`);
 });
+}
