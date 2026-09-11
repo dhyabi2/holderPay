@@ -123,8 +123,7 @@ const tokenOffer = makePolicy({
   resource: "e2e/token-lane",
   title: "e2e: TEACHER lane",
   description: "paid in TEACHER; XNO payers are swapped into it",
-  priceToken: PRICE_TOKEN.toString(),
-  token: { tokenId: TOKEN_ID, symbol: "TEACHER", decimals: DECIMALS },
+  accept: [{ tokenId: TOKEN_ID, symbol: "TEACHER", decimals: DECIMALS, price: PRICE_TOKEN.toString() }],
   autoswap: true,
   expires: 0,
 });

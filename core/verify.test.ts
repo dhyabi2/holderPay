@@ -9,7 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as nanocurrency from "nanocurrency";
 
-import { makePolicy, type Policy } from "./policy.ts";
+import { makePolicy, acceptedToken, type Policy } from "./policy.ts";
 import { memoLink, signAuth, verifyAuth, grantId, RECEIPT_MARKER } from "./proof.ts";
 import { verifyPayment } from "./verify.ts";
 import type { ChainReader, VerifiedBlock } from "./block.ts";
@@ -99,13 +99,15 @@ function tokenPolicy(over: Partial<Parameters<typeof makePolicy>[0]> = {}): Poli
     resource: "course/nano-101",
     title: "Nano 101",
     description: "one course",
-    priceToken: "1000000", // 1.000000 TEACHER at 6 decimals
-    token: { tokenId: TOKEN_ID, symbol: "TEACHER", decimals: 6 },
+    accept: [{ tokenId: TOKEN_ID, symbol: "TEACHER", decimals: 6, price: "1000000" }],
     autoswap: true,
     expires: 0,
     ...over,
   });
 }
+
+/** The price this offer charges in a given token. */
+const tokenPrice = (p: Policy, tokenId = TOKEN_ID) => acceptedToken(p, tokenId)!.price;
 
 /** Open the buyer's chain with some funds, returning the frontier. */
 function openChain(r: MemoryReader, k = buyer, balance = XNO): string {
@@ -153,7 +155,7 @@ test("TOKEN: a replay-applied transfer of the price grants", async () => {
   const [fragALink, fragBLink] = encodeFragLinks(TOKEN_ID, {
     kind: "transfer",
     to: MERCHANT,
-    amount: BigInt(policy.priceToken!),
+    amount: BigInt(tokenPrice(policy)),
   });
   const open = openChain(r);
   const fragA = r.add(buyer, { previous: open, balance: XNO - 1n, link: fragALink });
@@ -164,7 +166,7 @@ test("TOKEN: a replay-applied transfer of the price grants", async () => {
   const v = await verifyPayment(policy, receipt.hash, r);
   assert.equal(v.granted, true, v.reason);
   assert.equal(v.asset, "TOKEN");
-  assert.equal(v.paid, policy.priceToken);
+  assert.equal(v.paid, tokenPrice(policy));
 });
 
 // ── forgery attempts ────────────────────────────────────────────────────────
@@ -286,7 +288,7 @@ test("an expired offer denies even when fully paid", async () => {
 
 test("XNO sent to the right merchant does not satisfy a token-only offer", async () => {
   const r = new MemoryReader();
-  const policy = tokenPolicy({ priceXno: undefined });
+  const policy = tokenPolicy();
   const { receipt } = payXno(r, policy, XNO / 2n);
   const v = await verifyPayment(policy, receipt.hash, r);
   assert.equal(v.granted, false);
@@ -299,7 +301,7 @@ test("a token transfer that did not apply in replay denies", async () => {
   const [fragALink, fragBLink] = encodeFragLinks(TOKEN_ID, {
     kind: "transfer",
     to: MERCHANT,
-    amount: BigInt(policy.priceToken!),
+    amount: BigInt(tokenPrice(policy)),
   });
   const open = openChain(r);
   const fragA = r.add(buyer, { previous: open, balance: XNO - 1n, link: fragALink });
@@ -318,7 +320,7 @@ test("a transfer of the RIGHT amount of the WRONG token denies", async () => {
   const [fragALink, fragBLink] = encodeFragLinks(otherToken, {
     kind: "transfer",
     to: MERCHANT,
-    amount: BigInt(policy.priceToken!),
+    amount: BigInt(tokenPrice(policy)),
   });
   const open = openChain(r);
   const fragA = r.add(buyer, { previous: open, balance: XNO - 1n, link: fragALink });
@@ -336,7 +338,7 @@ test("a token transfer to a different recipient denies", async () => {
   const [fragALink, fragBLink] = encodeFragLinks(TOKEN_ID, {
     kind: "transfer",
     to: other.address,
-    amount: BigInt(policy.priceToken!),
+    amount: BigInt(tokenPrice(policy)),
   });
   const open = openChain(r);
   const fragA = r.add(buyer, { previous: open, balance: XNO - 1n, link: fragALink });
@@ -354,7 +356,7 @@ test("a verifier that cannot replay refuses token payments instead of guessing",
   const [fragALink, fragBLink] = encodeFragLinks(TOKEN_ID, {
     kind: "transfer",
     to: MERCHANT,
-    amount: BigInt(policy.priceToken!),
+    amount: BigInt(tokenPrice(policy)),
   });
   const open = openChain(r);
   const fragA = r.add(buyer, { previous: open, balance: XNO - 1n, link: fragALink });

@@ -215,8 +215,7 @@ test("the auto-swap lane really produces a verifiable TEACHER payment", async ()
     resource: "course/nano-101",
     title: "Nano 101",
     description: "",
-    priceToken: price.toString(),
-    token: { tokenId, symbol: "TEACHER", decimals: DECIMALS },
+    accept: [{ tokenId, symbol: "TEACHER", decimals: DECIMALS, price: price.toString() }],
     autoswap: true,
     expires: 0,
   });
@@ -250,8 +249,7 @@ test("a transfer of tokens the payer never bought does not apply, so it is refus
     resource: "course/nano-101",
     title: "Nano 101",
     description: "",
-    priceToken: price.toString(),
-    token: { tokenId, symbol: "TEACHER", decimals: DECIMALS },
+    accept: [{ tokenId, symbol: "TEACHER", decimals: DECIMALS, price: price.toString() }],
     autoswap: true,
     expires: 0,
   });

@@ -19,7 +19,8 @@ const DECIMALS = 6;
 
 if (!MERCHANT) throw new Error("MERCHANT_ADDRESS is not set");
 
-const token = TOKEN_ID ? { tokenId: TOKEN_ID, symbol: "TEACHER", decimals: DECIMALS } : undefined;
+const PRICE_1 = (1n * 10n ** BigInt(DECIMALS)).toString();
+const accept = TOKEN_ID ? [{ tokenId: TOKEN_ID, symbol: "TEACHER", decimals: DECIMALS, price: PRICE_1 }] : [];
 
 const offers = [
   {
@@ -29,8 +30,7 @@ const offers = [
       title: "Nano 101 — the full course",
       description:
         "Pay in TEACHER, or pay in XNO and let the page swap it into TEACHER for the seller. Either way your access is proven by a block, not by our database.",
-      token,
-      priceToken: token ? (1n * 10n ** BigInt(DECIMALS)).toString() : undefined,
+      accept,
       priceXno: toRaw("0.00001", 30).toString(),
       autoswap: true,
       expires: 0,
@@ -50,8 +50,7 @@ const offers = [
       title: "TEACHER only — no XNO accepted",
       description:
         "This seller wants the token and nothing else. XNO payers are auto-swapped on the AMM inside their own wallet; the seller is paid in TEACHER.",
-      token,
-      priceToken: token ? (1n * 10n ** BigInt(DECIMALS)).toString() : undefined,
+      accept,
       priceXno: undefined,
       autoswap: true,
       expires: 0,
@@ -61,15 +60,12 @@ const offers = [
 ];
 
 for (const o of offers) {
-  if (!o.input.priceToken && !o.input.priceXno) {
+  if (o.input.accept.length === 0 && !o.input.priceXno) {
     console.log(`skipped "${o.input.title}" -- no accepted asset (launch TEACHER first)`);
     continue;
   }
   const l = catalog.put(o.input as any, o.unlock);
-  const bits: string[] = [];
-  if (l.policy.priceToken && l.policy.token) {
-    bits.push(`${fromRaw(l.policy.priceToken, l.policy.token.decimals)} ${l.policy.token.symbol}`);
-  }
+  const bits = (l.policy.accept ?? []).map((a) => `${fromRaw(a.price, a.decimals)} ${a.symbol}`);
   if (l.policy.priceXno) bits.push(`${fromRaw(l.policy.priceXno, 30)} XNO`);
   console.log(`published  ${l.policy.title}`);
   console.log(`  policy   ${l.policy.id}`);

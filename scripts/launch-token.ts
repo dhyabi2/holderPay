@@ -30,8 +30,12 @@ const arg = (name: string, dflt: string): string => {
 const flag = (name: string) => argv.includes("--" + name);
 
 const DECIMALS = 6;
-const SYMBOL = "TEACHER";
-const NAME = "Teacher";
+// Any symbol: holderPay is not a one-token app. `--env-key STUDENT` writes
+// STUDENT_TOKEN_ID / STUDENT_LAUNCH_HASH instead of the TEACHER pair, so a
+// second launch does not overwrite the first.
+const SYMBOL = arg("symbol", "TEACHER").toUpperCase();
+const NAME = arg("name", SYMBOL.charAt(0) + SYMBOL.slice(1).toLowerCase());
+const ENV_KEY = arg("env-key", SYMBOL).toUpperCase().replace(/[^A-Z0-9_]/g, "_");
 
 const wholeSupply = BigInt(arg("supply", "1000000")); // 1,000,000 TEACHER
 const seedTokensWhole = BigInt(arg("seed-tokens", "100000")); // into the curve
@@ -110,11 +114,16 @@ async function main() {
 
   // ── persist ───────────────────────────────────────────────────────────────
   let envText = fs.readFileSync(".env", "utf-8");
-  envText = envText
-    .replace(/^TEACHER_TOKEN_ID=.*$/m, `TEACHER_TOKEN_ID=${tokenId}`)
-    .replace(/^TEACHER_LAUNCH_HASH=.*$/m, `TEACHER_LAUNCH_HASH=${launchHash}`);
+  const idKey = `${ENV_KEY}_TOKEN_ID`;
+  const hashKey = `${ENV_KEY}_LAUNCH_HASH`;
+  const upsert = (text: string, key: string, value: string) =>
+    new RegExp(`^${key}=.*$`, "m").test(text)
+      ? text.replace(new RegExp(`^${key}=.*$`, "m"), `${key}=${value}`)
+      : `${text.replace(/\n*$/, "")}\n${key}=${value}\n`;
+  envText = upsert(envText, idKey, tokenId);
+  envText = upsert(envText, hashKey, launchHash);
   fs.writeFileSync(".env", envText);
-  say(`\nwrote TEACHER_TOKEN_ID to .env`);
+  say(`\nwrote ${idKey} to .env`);
 
   if (flag("publish")) await publishMeta(tokenId);
 

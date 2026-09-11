@@ -15,6 +15,7 @@
 import * as nanocurrency from "nanocurrency";
 import { memoLink, signAuth } from "../core/proof.ts";
 import { lanesOf } from "../core/verify.ts";
+import { acceptedTokens, acceptedToken, swapTarget, type AcceptedToken } from "../core/policy.ts";
 import type { Policy } from "../core/policy.ts";
 import type { Verdict } from "../core/verify.ts";
 import { keysFromSeed, toRaw, fromRaw, receiveAll, sendXno, submitLink, tip, type Keys } from "../core/wallet.ts";
@@ -64,11 +65,25 @@ interface Listing {
   receiptLink: string;
 }
 
+/** One row of the token list, as /api/tokens returns it. */
+interface TokenRow {
+  tokenId: string;
+  symbol: string;
+  decimals: number;
+  balance: string;
+  backing: string;
+  backedHoldingValue: string;
+  quotedHoldingValue: string;
+  backedPct: number | null;
+}
+
 let cfg: Config;
 let listings: Listing[] = [];
 let current: Listing | null = null;
 let keys: Keys;
 let tokenView: any = null;
+/** Every token this browser can see, sorted by real collateral, richest first. */
+let myTokens: TokenRow[] = [];
 let lastReceipt = "";
 
 const SEED_KEY = "holderpay.seed.v1";
@@ -124,14 +139,17 @@ function renderOffer() {
   $("offerDesc").textContent = p.description;
   $("switchOffer").hidden = listings.length < 2;
 
-  // One headline price, with the alternative asset as a quiet aside.
+  // One headline price. Everything else the offer takes is a quiet aside, in
+  // the same order the pay buttons appear -- most valuable to this buyer first.
   const box = $("offerPrice");
   box.replaceChildren();
-  const token = p.priceToken && p.token ? `${fromRaw(p.priceToken, p.token.decimals)} ${p.token.symbol}` : "";
-  const xno = p.priceXno ? `${fromRaw(p.priceXno, 30)} XNO` : "";
-  const [headline, alt] = token ? [token, xno] : [xno, ""];
-  box.appendChild(el("span", "", headline || "—"));
-  if (alt) box.appendChild(el("span", "alt", `or ${alt}`));
+  const prices = acceptedTokens(p)
+    .map((a) => ({ a, rank: rankOf(a.tokenId) }))
+    .sort((x, y) => (y.rank > x.rank ? 1 : y.rank < x.rank ? -1 : 0))
+    .map(({ a }) => `${fromRaw(a.price, a.decimals)} ${a.symbol || a.tokenId.slice(0, 6)}`);
+  if (p.priceXno) prices.push(`${fromRaw(p.priceXno, 30)} XNO`);
+  box.appendChild(el("span", "", prices[0] ?? "\u2014"));
+  if (prices.length > 1) box.appendChild(el("span", "alt", `or ${prices.slice(1).join(" / ")}`));
 
   renderPayActions();
 }
@@ -147,25 +165,72 @@ function payOption(label: string, hint: string, onClick: () => void, disabled = 
   return btn;
 }
 
+/**
+ * Where a token sits in this buyer's list, as a sortable number.
+ *
+ * The rank is the token's BACKED holding value -- the buyer's pro-rata share of
+ * real collateral -- not the AMM quote. A token's quoted price is a free
+ * declaration (three raw buys one quoting a million XNO a unit), so ranking by
+ * it would reliably float the cheapest lie to the top of the buyer's wallet.
+ * See core/valuation.ts.
+ */
+function rankOf(tokenId: string): bigint {
+  const row = myTokens.find((t) => t.tokenId === tokenId.toLowerCase());
+  if (!row) return -1n;
+  try {
+    return BigInt(row.backedHoldingValue);
+  } catch {
+    return 0n;
+  }
+}
+
+function heldBalance(tokenId: string): bigint {
+  const row = myTokens.find((t) => t.tokenId === tokenId.toLowerCase());
+  try {
+    return BigInt(row?.balance ?? "0");
+  } catch {
+    return 0n;
+  }
+}
+
 function renderPayActions() {
   if (!current) return;
   const p = current.policy;
   const box = $("payActions");
   box.replaceChildren();
   const lanes = lanesOf(p);
-  const dec = p.token?.decimals ?? 6;
 
-  if (lanes.includes("TOKEN") && p.token) {
-    const have = BigInt(tokenView?.you?.balance ?? "0");
-    const need = BigInt(p.priceToken!);
-    box.appendChild(
-      payOption(
-        `Pay ${fromRaw(need, dec)} ${p.token.symbol}`,
-        `you hold ${fromRaw(have, dec)} ${p.token.symbol}`,
-        () => payWithToken(),
-        have < need
-      )
-    );
+  // One button per accepted token, richest-to-this-buyer first, so what they
+  // can actually pay with sits at the top. Tokens they cannot cover still show
+  // -- disabled, with the shortfall in the tooltip -- because hiding them makes
+  // an offer look narrower than it is.
+  if (lanes.includes("TOKEN")) {
+    const rows = acceptedTokens(p)
+      .map((a) => ({ a, have: heldBalance(a.tokenId), rank: rankOf(a.tokenId) }))
+      .sort((x, y) => {
+        // Affordable first, then by real backed value, then by symbol so the
+        // order never depends on map iteration.
+        const xOk = x.have >= BigInt(x.a.price) ? 1 : 0;
+        const yOk = y.have >= BigInt(y.a.price) ? 1 : 0;
+        if (xOk !== yOk) return yOk - xOk;
+        if (x.rank !== y.rank) return y.rank > x.rank ? 1 : -1;
+        return (x.a.symbol || x.a.tokenId).localeCompare(y.a.symbol || y.a.tokenId);
+      });
+
+    for (const { a, have } of rows) {
+      const need = BigInt(a.price);
+      const sym = a.symbol || a.tokenId.slice(0, 6);
+      box.appendChild(
+        payOption(
+          `Pay ${fromRaw(need, a.decimals)} ${sym}`,
+          have >= need
+            ? `you hold ${fromRaw(have, a.decimals)} ${sym}`
+            : `you hold ${fromRaw(have, a.decimals)} ${sym} \u2014 ${fromRaw(need - have, a.decimals)} short`,
+          () => payWithToken(a),
+          have < need
+        )
+      );
+    }
   }
 
   if (lanes.includes("XNO")) {
@@ -174,14 +239,16 @@ function renderPayActions() {
     );
   }
 
-  // The auto-swap lane: the merchant wants the token, the buyer has XNO.
-  if (p.autoswap && p.token && p.priceToken) {
+  // The auto-swap lane: the merchant wants a token, the buyer has XNO.
+  const target = swapTarget(p);
+  if (p.autoswap && target) {
     const canQuote = tokenView && BigInt(tokenView.poolXno ?? "0") > 0n;
+    const sym = target.symbol || target.tokenId.slice(0, 6);
     box.appendChild(
       payOption(
-        `Pay with XNO \u2192 ${p.token.symbol}`,
+        `Pay with XNO \u2192 ${sym}`,
         "buys the token on the AMM in your own wallet, then pays the merchant in it",
-        () => payWithSwap(),
+        () => payWithSwap(target),
         !canQuote
       )
     );
@@ -287,20 +354,14 @@ async function payWithXno() {
   }
 }
 
-async function payWithToken() {
-  if (!current?.policy.token) return;
+async function payWithToken(a: AcceptedToken) {
+  if (!current) return;
   const p = current.policy;
+  const sym = a.symbol || a.tokenId.slice(0, 6);
   try {
-    status(`Paying ${fromRaw(p.priceToken!, p.token!.decimals)} ${p.token!.symbol}\u2026`);
+    status(`Paying ${fromRaw(a.price, a.decimals)} ${sym}\u2026`);
     await ensureHellos();
-    const r = await payTokenWithReceipt(
-      rpc,
-      keys,
-      p.token!.tokenId,
-      p.merchant,
-      BigInt(p.priceToken!),
-      memoLink(p.id)
-    );
+    const r = await payTokenWithReceipt(rpc, keys, a.tokenId, p.merchant, BigInt(a.price), memoLink(p.id));
     log(`transfer ${short(r.fragA)} + ${short(r.payment)}`, "ok");
     log(`receipt block ${short(r.receipt)}`, "ok");
     await onPaid(r.receipt);
@@ -315,17 +376,19 @@ async function payWithToken() {
  * then pays the merchant in the token. The merchant never touches XNO; the
  * buyer never has to source the token in advance.
  */
-async function payWithSwap() {
-  if (!current?.policy.token) return;
+async function payWithSwap(a: AcceptedToken) {
+  if (!current) return;
   const p = current.policy;
-  const want = BigInt(p.priceToken!);
+  const want = BigInt(a.price);
+  const sym = a.symbol || a.tokenId.slice(0, 6);
   try {
     await ensureHellos();
-    const have = BigInt(tokenView?.you?.balance ?? "0");
+    const have = heldBalance(a.tokenId);
     if (have < want) {
       const missing = want - have;
-      status(`Swapping XNO for ${fromRaw(missing, p.token!.decimals)} ${p.token!.symbol}\u2026`);
-      const st = await loadTokenState(true);
+      status(`Swapping XNO for ${fromRaw(missing, a.decimals)} ${sym}\u2026`);
+      const st = await loadTokenState(a.tokenId, true);
+      if (!st) throw new Error(`could not read ${sym}'s market`);
       const walletBalance = (await tip(rpc, keys.address)).balance;
       const plan: SwapPlan = planSwap({
         state: st as any,
@@ -336,15 +399,15 @@ async function payWithSwap() {
       });
       if (plan.problem && plan.tokensOut <= 0n) throw new Error(plan.problem);
       log(
-        `lane ${plan.lane}: ${fromRaw(plan.xno, 30)} XNO -> ${fromRaw(plan.tokensOut, p.token!.decimals)} ${p.token!.symbol}` +
+        `lane ${plan.lane}: ${fromRaw(plan.xno, 30)} XNO -> ${fromRaw(plan.tokensOut, a.decimals)} ${sym}` +
           (plan.payTo ? ` (paid straight to queued seller ${short(plan.payTo)})` : " (collateral stays in your wallet)")
       );
-      const h = await executeSwap(rpc, keys, p.token!.tokenId, plan);
+      const h = await executeSwap(rpc, keys, a.tokenId, plan);
       log(`swap block ${short(h)}`, "ok");
-      await loadTokenState(true);
+      await loadTokenState(a.tokenId, true);
     }
-    status(`Paying in ${p.token!.symbol}\u2026`);
-    const r = await payTokenWithReceipt(rpc, keys, p.token!.tokenId, p.merchant, want, memoLink(p.id));
+    status(`Paying in ${sym}\u2026`);
+    const r = await payTokenWithReceipt(rpc, keys, a.tokenId, p.merchant, want, memoLink(p.id));
     log(`receipt block ${short(r.receipt)}`, "ok");
     await onPaid(r.receipt);
   } catch (e: any) {
@@ -420,16 +483,15 @@ async function claimAccess(receipt: string) {
 
 // ── data loading ────────────────────────────────────────────────────────────
 
-async function loadTokenState(force = false) {
-  const tokenId = current?.policy.token?.tokenId || cfg.tokenId;
-  if (!tokenId) return null;
-  const res = await fetch(`/api/token?tokenId=${tokenId}&account=${encodeURIComponent(keys.address)}${force ? "&t=" + Date.now() : ""}`);
+async function loadTokenState(tokenId: string, force = false) {
+  const id = (tokenId || cfg.tokenId || "").toLowerCase();
+  if (!id) return null;
+  const res = await fetch(
+    `/api/token?tokenId=${id}&account=${encodeURIComponent(keys.address)}${force ? "&t=" + Date.now() : ""}`
+  );
   const j = await res.json();
   if (j.error) return null;
   tokenView = j;
-  $("balTok").textContent = fromRaw(j.you?.balance ?? "0", j.decimals ?? 6);
-  $("balTokLabel").textContent = j.symbol ?? "TEACHER";
-  $("tokenChip").textContent = `${j.symbol ?? "token"} ${short(j.tokenId, 6)}`;
   // The shape core/swap.ts expects: bigints, not strings.
   return {
     launched: j.launched,
@@ -441,6 +503,28 @@ async function loadTokenState(force = false) {
   };
 }
 
+/** Every token this browser can see, richest-to-this-buyer first. The ORDER is
+ * the server's, but the server has no discretion in it: the sort is a pure
+ * function of replayed collateral (core/valuation.ts), which this page could
+ * recompute itself from the same public blocks. */
+async function loadTokens() {
+  const res = await fetch(`/api/tokens?account=${encodeURIComponent(keys.address)}&t=${Date.now()}`);
+  const j = await res.json();
+  myTokens = Array.isArray(j.tokens) ? j.tokens : [];
+
+  // The wallet line shows the buyer's most valuable holding, whatever it is.
+  const top = myTokens.find((t) => BigInt(t.balance) > 0n);
+  $("balTok").textContent = top ? fromRaw(top.balance, top.decimals) : "0";
+  $("balTokLabel").textContent = top ? top.symbol : cfg.symbol || "tokens";
+  const held = myTokens.filter((t) => BigInt(t.balance) > 0n).length;
+  const n = myTokens.length;
+  $("tokenChip").textContent = held > 1
+    ? `${top!.symbol} +${held - 1}`
+    : top
+      ? top.symbol
+      : `${n} token${n === 1 ? "" : "s"}`;
+}
+
 async function refreshBalances() {
   try {
     const info = await rpc({ action: "account_info", account: keys.address });
@@ -448,8 +532,11 @@ async function refreshBalances() {
   } catch {
     $("balXno").textContent = "0";
   }
-  await loadTokenState(true);
-  renderPayActions();
+  await loadTokens();
+  // Keep the swap lane's market warm for the token an XNO payer lands in.
+  const target = current ? swapTarget(current.policy) : null;
+  if (target) await loadTokenState(target.tokenId, true);
+  renderOffer();
 }
 
 async function loadListings() {
@@ -507,7 +594,7 @@ function connectSocket() {
         void refreshBalances();
       } else {
         log(`confirmed ${short(hash)} on ${short(account)}`);
-        void loadTokenState(true);
+        void loadTokens();
       }
     };
     ws.onclose = () => {
@@ -533,17 +620,27 @@ function wireConfigPanel() {
   $("cfgSave").onclick = async () => {
     const val = (id: string) => ($(id) as HTMLInputElement).value.trim();
     const decimals = cfg.decimals ?? 6;
-    const tokenId = val("cfgTokenId").toLowerCase();
+    // Comma- or space-separated token ids, so one offer can take many tokens.
+    // Each is priced the same, because a price per token is the merchant's
+    // decision and there is no safe way to derive one automatically: a token's
+    // AMM quote is free to declare (core/valuation.ts).
+    const ids = val("cfgTokenId").toLowerCase().split(/[,\s]+/).filter(Boolean);
     const priceToken = val("cfgPriceToken");
     const priceXno = val("cfgPriceXno");
+    const symbols = val("cfgSymbol").split(/[,\s]+/).filter(Boolean);
+    const accept = ids.map((tokenId, i) => ({
+      tokenId,
+      symbol: symbols[i] ?? symbols[0] ?? "",
+      decimals,
+      price: toRaw(priceToken, decimals).toString(),
+    }));
     const body = {
       policy: {
         merchant: val("cfgMerchant"),
         resource: val("cfgResource"),
         title: val("cfgTitle"),
         description: val("cfgDesc"),
-        token: tokenId ? { tokenId, symbol: val("cfgSymbol"), decimals } : undefined,
-        priceToken: tokenId && priceToken ? toRaw(priceToken, decimals).toString() : undefined,
+        accept: priceToken ? accept : [],
         priceXno: priceXno ? toRaw(priceXno, 30).toString() : undefined,
         autoswap: ($("cfgAutoswap") as HTMLInputElement).checked,
         expires: 0,

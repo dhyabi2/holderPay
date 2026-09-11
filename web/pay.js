@@ -4949,7 +4949,7 @@ function assembleFrag(aHex, bHex) {
 // core/policy.ts
 init_buffer();
 init_process();
-function hashable(p) {
+function hashableV1(p) {
   return {
     v: 1,
     merchant: p.merchant,
@@ -4963,21 +4963,88 @@ function hashable(p) {
     expires: Math.floor(p.expires) || 0
   };
 }
+function hashableV2(p) {
+  const accept = normalizeAccept(p.accept);
+  return {
+    v: 2,
+    merchant: p.merchant,
+    resource: p.resource,
+    title: p.title,
+    description: p.description,
+    priceXno: p.priceXno ?? "",
+    accept: accept.map((a2) => ({
+      tokenId: a2.tokenId,
+      symbol: a2.symbol,
+      decimals: a2.decimals,
+      price: a2.price
+    })),
+    autoswap: !!p.autoswap,
+    swapInto: (p.swapInto ?? "").toLowerCase(),
+    expires: Math.floor(p.expires) || 0
+  };
+}
+function normalizeAccept(list) {
+  const byId = /* @__PURE__ */ new Map();
+  for (const a2 of list ?? []) {
+    const tokenId = String(a2?.tokenId ?? "").toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(tokenId)) continue;
+    let price;
+    try {
+      price = BigInt(a2.price);
+    } catch {
+      continue;
+    }
+    if (price <= 0n) continue;
+    if (byId.has(tokenId)) continue;
+    byId.set(tokenId, {
+      tokenId,
+      symbol: String(a2.symbol ?? ""),
+      decimals: Number(a2.decimals) || 0,
+      price: price.toString()
+    });
+  }
+  return [...byId.values()].sort((x2, y) => x2.tokenId < y.tokenId ? -1 : x2.tokenId > y.tokenId ? 1 : 0);
+}
 function policyId(p) {
-  return h256(DOMAIN_POLICY, canonicalJson(hashable(p)));
+  const v2 = p.v ?? 2;
+  return h256(DOMAIN_POLICY, canonicalJson(v2 === 1 ? hashableV1(p) : hashableV2(p)));
 }
 function policyIsIntact(p) {
-  return p.v === 1 && policyId(p) === p.id;
+  if (p.v !== 1 && p.v !== 2) return false;
+  return policyId(p) === p.id;
+}
+function acceptedTokens(p) {
+  if ((p.v ?? 2) === 1) {
+    if (!p.token || !p.priceToken || BigInt(p.priceToken) <= 0n) return [];
+    return [
+      {
+        tokenId: p.token.tokenId.toLowerCase(),
+        symbol: p.token.symbol,
+        decimals: p.token.decimals,
+        price: p.priceToken
+      }
+    ];
+  }
+  return normalizeAccept(p.accept);
+}
+function acceptedToken(p, tokenId) {
+  const want = (tokenId ?? "").toLowerCase();
+  return acceptedTokens(p).find((a2) => a2.tokenId === want) ?? null;
+}
+function swapTarget(p) {
+  const list = acceptedTokens(p);
+  if (list.length === 0) return null;
+  const want = (p.swapInto ?? "").toLowerCase();
+  return list.find((a2) => a2.tokenId === want) ?? list[0];
 }
 function acceptsXno(p) {
   return !!p.priceXno && BigInt(p.priceXno) > 0n;
 }
 function acceptsToken(p) {
-  return !!p.priceToken && !!p.token && BigInt(p.priceToken) > 0n;
+  return acceptedTokens(p).length > 0;
 }
-function priceOf(p, asset) {
-  if (asset === "XNO") return acceptsXno(p) ? BigInt(p.priceXno) : null;
-  return acceptsToken(p) ? BigInt(p.priceToken) : null;
+function priceXnoOf(p) {
+  return acceptsXno(p) ? BigInt(p.priceXno) : null;
 }
 
 // core/block.ts
@@ -5056,6 +5123,8 @@ function finish(policy, lane, confirmed, base) {
     payment: lane.payment,
     paid: lane.paid.toString(),
     price: lane.price.toString(),
+    tokenId: lane.tokenId,
+    symbol: lane.symbol,
     ...base
   };
   if (lane.fail) return { ...common, reason: lane.fail };
@@ -5071,7 +5140,7 @@ function finish(policy, lane, confirmed, base) {
 async function xnoLane(policy, payment, reader) {
   const dest = linkAsAddress(payment.link);
   if (!dest || !sameAccount(dest, policy.merchant)) return null;
-  const price = priceOf(policy, "XNO");
+  const price = priceXnoOf(policy);
   if (price == null) {
     return { asset: "XNO", paid: 0n, price: 0n, payment: payment.hash, fail: "this offer does not accept XNO" };
   }
@@ -5093,22 +5162,33 @@ async function tokenLane(policy, receipt, fragB, reader) {
     return null;
   }
   if (assembled.op?.kind !== "transfer") return null;
-  const price = priceOf(policy, "TOKEN");
-  if (price == null || !acceptsToken(policy)) {
+  if (!acceptsToken(policy)) {
     return { asset: "TOKEN", paid: 0n, price: 0n, payment: fragB.hash, fail: "this offer does not accept tokens" };
   }
-  const want = policy.token.tokenId.toLowerCase();
-  if (assembled.tokenId.toLowerCase() !== want) {
+  const paidId = assembled.tokenId.toLowerCase();
+  const entry = acceptedToken(policy, paidId);
+  if (!entry) {
+    const listed = acceptedTokens(policy).map((a2) => a2.symbol || a2.tokenId.slice(0, 8)).join(", ");
+    return {
+      asset: "TOKEN",
+      paid: 0n,
+      price: 0n,
+      payment: fragB.hash,
+      fail: `wrong token: paid ${paidId.slice(0, 10)}, this offer takes ${listed}`,
+      tokenId: paidId
+    };
+  }
+  const price = BigInt(entry.price);
+  if (!sameAccount(assembled.op.to, policy.merchant)) {
     return {
       asset: "TOKEN",
       paid: 0n,
       price,
       payment: fragB.hash,
-      fail: `wrong token: paid ${assembled.tokenId.slice(0, 10)} but this offer wants ${want.slice(0, 10)}`
+      tokenId: paidId,
+      symbol: entry.symbol,
+      fail: "token transfer was sent to a different address"
     };
-  }
-  if (!sameAccount(assembled.op.to, policy.merchant)) {
-    return { asset: "TOKEN", paid: 0n, price, payment: fragB.hash, fail: "token transfer was sent to a different address" };
   }
   const amount = assembled.op.amount;
   if (!reader.tokenOpApplied) {
@@ -5117,6 +5197,8 @@ async function tokenLane(policy, receipt, fragB, reader) {
       paid: amount,
       price,
       payment: fragB.hash,
+      tokenId: paidId,
+      symbol: entry.symbol,
       fail: "this verifier cannot replay the token ledger, so a token payment cannot be proven here"
     };
   }
@@ -5127,10 +5209,12 @@ async function tokenLane(policy, receipt, fragB, reader) {
       paid: amount,
       price,
       payment: fragB.hash,
+      tokenId: paidId,
+      symbol: entry.symbol,
       fail: `token transfer is signed but did not apply in the ledger: ${applied.reason}`
     };
   }
-  return { asset: "TOKEN", paid: amount, price, payment: fragB.hash };
+  return { asset: "TOKEN", paid: amount, price, payment: fragB.hash, tokenId: paidId, symbol: entry.symbol };
 }
 function lanesOf(policy) {
   const out = [];
@@ -7198,7 +7282,7 @@ function carriersOf(e2) {
   const hashes = e2.carriers && e2.carriers.length ? e2.carriers : [e2.hash];
   return hashes.map((h) => h.toUpperCase());
 }
-async function watchSet(reader, seeds) {
+async function watchSet(reader, seeds, cap = 400) {
   const set3 = new Set(seeds.filter(Boolean));
   const hops = await Promise.all(
     seeds.filter(Boolean).map(async (a2) => {
@@ -7213,7 +7297,13 @@ async function watchSet(reader, seeds) {
     for (const h of cp.inbound) set3.add(h.sender);
     for (const a2 of cp.outbound) set3.add(a2);
   }
-  return [...set3].filter(Boolean).sort();
+  const kept = new Set(seeds.filter(Boolean));
+  const discovered = [...set3].filter((a2) => a2 && !kept.has(a2)).sort();
+  for (const a2 of discovered) {
+    if (kept.size >= cap) break;
+    kept.add(a2);
+  }
+  return [...kept].filter(Boolean).sort();
 }
 async function foldAccounts(source, accounts, meta) {
   const indexer = new MultiIndexer(source, meta ? metaMapResolver(meta) : void 0);
@@ -7352,6 +7442,7 @@ var listings = [];
 var current = null;
 var keys;
 var tokenView = null;
+var myTokens = [];
 var lastReceipt = "";
 var SEED_KEY = "holderpay.seed.v1";
 var RECEIPTS_KEY = "holderpay.receipts.v1";
@@ -7401,11 +7492,10 @@ function renderOffer() {
   $2("switchOffer").hidden = listings.length < 2;
   const box = $2("offerPrice");
   box.replaceChildren();
-  const token = p.priceToken && p.token ? `${fromRaw(p.priceToken, p.token.decimals)} ${p.token.symbol}` : "";
-  const xno = p.priceXno ? `${fromRaw(p.priceXno, 30)} XNO` : "";
-  const [headline, alt] = token ? [token, xno] : [xno, ""];
-  box.appendChild(el("span", "", headline || "\u2014"));
-  if (alt) box.appendChild(el("span", "alt", `or ${alt}`));
+  const prices = acceptedTokens(p).map((a2) => ({ a: a2, rank: rankOf(a2.tokenId) })).sort((x2, y) => y.rank > x2.rank ? 1 : y.rank < x2.rank ? -1 : 0).map(({ a: a2 }) => `${fromRaw(a2.price, a2.decimals)} ${a2.symbol || a2.tokenId.slice(0, 6)}`);
+  if (p.priceXno) prices.push(`${fromRaw(p.priceXno, 30)} XNO`);
+  box.appendChild(el("span", "", prices[0] ?? "\u2014"));
+  if (prices.length > 1) box.appendChild(el("span", "alt", `or ${prices.slice(1).join(" / ")}`));
   renderPayActions();
 }
 function payOption(label, hint, onClick, disabled = false) {
@@ -7418,37 +7508,64 @@ function payOption(label, hint, onClick, disabled = false) {
   };
   return btn;
 }
+function rankOf(tokenId) {
+  const row = myTokens.find((t) => t.tokenId === tokenId.toLowerCase());
+  if (!row) return -1n;
+  try {
+    return BigInt(row.backedHoldingValue);
+  } catch {
+    return 0n;
+  }
+}
+function heldBalance(tokenId) {
+  const row = myTokens.find((t) => t.tokenId === tokenId.toLowerCase());
+  try {
+    return BigInt(row?.balance ?? "0");
+  } catch {
+    return 0n;
+  }
+}
 function renderPayActions() {
   if (!current) return;
   const p = current.policy;
   const box = $2("payActions");
   box.replaceChildren();
   const lanes = lanesOf(p);
-  const dec = p.token?.decimals ?? 6;
-  if (lanes.includes("TOKEN") && p.token) {
-    const have = BigInt(tokenView?.you?.balance ?? "0");
-    const need = BigInt(p.priceToken);
-    box.appendChild(
-      payOption(
-        `Pay ${fromRaw(need, dec)} ${p.token.symbol}`,
-        `you hold ${fromRaw(have, dec)} ${p.token.symbol}`,
-        () => payWithToken(),
-        have < need
-      )
-    );
+  if (lanes.includes("TOKEN")) {
+    const rows = acceptedTokens(p).map((a2) => ({ a: a2, have: heldBalance(a2.tokenId), rank: rankOf(a2.tokenId) })).sort((x2, y) => {
+      const xOk = x2.have >= BigInt(x2.a.price) ? 1 : 0;
+      const yOk = y.have >= BigInt(y.a.price) ? 1 : 0;
+      if (xOk !== yOk) return yOk - xOk;
+      if (x2.rank !== y.rank) return y.rank > x2.rank ? 1 : -1;
+      return (x2.a.symbol || x2.a.tokenId).localeCompare(y.a.symbol || y.a.tokenId);
+    });
+    for (const { a: a2, have } of rows) {
+      const need = BigInt(a2.price);
+      const sym = a2.symbol || a2.tokenId.slice(0, 6);
+      box.appendChild(
+        payOption(
+          `Pay ${fromRaw(need, a2.decimals)} ${sym}`,
+          have >= need ? `you hold ${fromRaw(have, a2.decimals)} ${sym}` : `you hold ${fromRaw(have, a2.decimals)} ${sym} \u2014 ${fromRaw(need - have, a2.decimals)} short`,
+          () => payWithToken(a2),
+          have < need
+        )
+      );
+    }
   }
   if (lanes.includes("XNO")) {
     box.appendChild(
       payOption(`Pay ${fromRaw(p.priceXno, 30)} XNO`, "straight to the merchant, wallet to wallet", () => payWithXno())
     );
   }
-  if (p.autoswap && p.token && p.priceToken) {
+  const target = swapTarget(p);
+  if (p.autoswap && target) {
     const canQuote = tokenView && BigInt(tokenView.poolXno ?? "0") > 0n;
+    const sym = target.symbol || target.tokenId.slice(0, 6);
     box.appendChild(
       payOption(
-        `Pay with XNO \u2192 ${p.token.symbol}`,
+        `Pay with XNO \u2192 ${sym}`,
         "buys the token on the AMM in your own wallet, then pays the merchant in it",
-        () => payWithSwap(),
+        () => payWithSwap(target),
         !canQuote
       )
     );
@@ -7541,20 +7658,14 @@ async function payWithXno() {
     status(e2.message, "err");
   }
 }
-async function payWithToken() {
-  if (!current?.policy.token) return;
+async function payWithToken(a2) {
+  if (!current) return;
   const p = current.policy;
+  const sym = a2.symbol || a2.tokenId.slice(0, 6);
   try {
-    status(`Paying ${fromRaw(p.priceToken, p.token.decimals)} ${p.token.symbol}\u2026`);
+    status(`Paying ${fromRaw(a2.price, a2.decimals)} ${sym}\u2026`);
     await ensureHellos();
-    const r2 = await payTokenWithReceipt(
-      rpc,
-      keys,
-      p.token.tokenId,
-      p.merchant,
-      BigInt(p.priceToken),
-      memoLink(p.id)
-    );
+    const r2 = await payTokenWithReceipt(rpc, keys, a2.tokenId, p.merchant, BigInt(a2.price), memoLink(p.id));
     log(`transfer ${short(r2.fragA)} + ${short(r2.payment)}`, "ok");
     log(`receipt block ${short(r2.receipt)}`, "ok");
     await onPaid(r2.receipt);
@@ -7562,17 +7673,19 @@ async function payWithToken() {
     status(e2.message, "err");
   }
 }
-async function payWithSwap() {
-  if (!current?.policy.token) return;
+async function payWithSwap(a2) {
+  if (!current) return;
   const p = current.policy;
-  const want = BigInt(p.priceToken);
+  const want = BigInt(a2.price);
+  const sym = a2.symbol || a2.tokenId.slice(0, 6);
   try {
     await ensureHellos();
-    const have = BigInt(tokenView?.you?.balance ?? "0");
+    const have = heldBalance(a2.tokenId);
     if (have < want) {
       const missing = want - have;
-      status(`Swapping XNO for ${fromRaw(missing, p.token.decimals)} ${p.token.symbol}\u2026`);
-      const st = await loadTokenState(true);
+      status(`Swapping XNO for ${fromRaw(missing, a2.decimals)} ${sym}\u2026`);
+      const st = await loadTokenState(a2.tokenId, true);
+      if (!st) throw new Error(`could not read ${sym}'s market`);
       const walletBalance = (await tip(rpc, keys.address)).balance;
       const plan = planSwap({
         state: st,
@@ -7583,14 +7696,14 @@ async function payWithSwap() {
       });
       if (plan.problem && plan.tokensOut <= 0n) throw new Error(plan.problem);
       log(
-        `lane ${plan.lane}: ${fromRaw(plan.xno, 30)} XNO -> ${fromRaw(plan.tokensOut, p.token.decimals)} ${p.token.symbol}` + (plan.payTo ? ` (paid straight to queued seller ${short(plan.payTo)})` : " (collateral stays in your wallet)")
+        `lane ${plan.lane}: ${fromRaw(plan.xno, 30)} XNO -> ${fromRaw(plan.tokensOut, a2.decimals)} ${sym}` + (plan.payTo ? ` (paid straight to queued seller ${short(plan.payTo)})` : " (collateral stays in your wallet)")
       );
-      const h = await executeSwap(rpc, keys, p.token.tokenId, plan);
+      const h = await executeSwap(rpc, keys, a2.tokenId, plan);
       log(`swap block ${short(h)}`, "ok");
-      await loadTokenState(true);
+      await loadTokenState(a2.tokenId, true);
     }
-    status(`Paying in ${p.token.symbol}\u2026`);
-    const r2 = await payTokenWithReceipt(rpc, keys, p.token.tokenId, p.merchant, want, memoLink(p.id));
+    status(`Paying in ${sym}\u2026`);
+    const r2 = await payTokenWithReceipt(rpc, keys, a2.tokenId, p.merchant, want, memoLink(p.id));
     log(`receipt block ${short(r2.receipt)}`, "ok");
     await onPaid(r2.receipt);
   } catch (e2) {
@@ -7656,16 +7769,15 @@ async function claimAccess(receipt) {
     status(e2.message, "err");
   }
 }
-async function loadTokenState(force = false) {
-  const tokenId = current?.policy.token?.tokenId || cfg.tokenId;
-  if (!tokenId) return null;
-  const res = await fetch(`/api/token?tokenId=${tokenId}&account=${encodeURIComponent(keys.address)}${force ? "&t=" + Date.now() : ""}`);
+async function loadTokenState(tokenId, force = false) {
+  const id = (tokenId || cfg.tokenId || "").toLowerCase();
+  if (!id) return null;
+  const res = await fetch(
+    `/api/token?tokenId=${id}&account=${encodeURIComponent(keys.address)}${force ? "&t=" + Date.now() : ""}`
+  );
   const j2 = await res.json();
   if (j2.error) return null;
   tokenView = j2;
-  $2("balTok").textContent = fromRaw(j2.you?.balance ?? "0", j2.decimals ?? 6);
-  $2("balTokLabel").textContent = j2.symbol ?? "TEACHER";
-  $2("tokenChip").textContent = `${j2.symbol ?? "token"} ${short(j2.tokenId, 6)}`;
   return {
     launched: j2.launched,
     direct: j2.direct,
@@ -7675,6 +7787,17 @@ async function loadTokenState(force = false) {
     earmarkFloor: /* @__PURE__ */ new Map([[keys.address, BigInt(j2.you?.floor ?? "0")]])
   };
 }
+async function loadTokens() {
+  const res = await fetch(`/api/tokens?account=${encodeURIComponent(keys.address)}&t=${Date.now()}`);
+  const j2 = await res.json();
+  myTokens = Array.isArray(j2.tokens) ? j2.tokens : [];
+  const top = myTokens.find((t) => BigInt(t.balance) > 0n);
+  $2("balTok").textContent = top ? fromRaw(top.balance, top.decimals) : "0";
+  $2("balTokLabel").textContent = top ? top.symbol : cfg.symbol || "tokens";
+  const held = myTokens.filter((t) => BigInt(t.balance) > 0n).length;
+  const n2 = myTokens.length;
+  $2("tokenChip").textContent = held > 1 ? `${top.symbol} +${held - 1}` : top ? top.symbol : `${n2} token${n2 === 1 ? "" : "s"}`;
+}
 async function refreshBalances() {
   try {
     const info = await rpc({ action: "account_info", account: keys.address });
@@ -7682,8 +7805,10 @@ async function refreshBalances() {
   } catch {
     $2("balXno").textContent = "0";
   }
-  await loadTokenState(true);
-  renderPayActions();
+  await loadTokens();
+  const target = current ? swapTarget(current.policy) : null;
+  if (target) await loadTokenState(target.tokenId, true);
+  renderOffer();
 }
 async function loadListings() {
   const j2 = await (await fetch("/api/policies")).json();
@@ -7733,7 +7858,7 @@ function connectSocket() {
         void refreshBalances();
       } else {
         log(`confirmed ${short(hash)} on ${short(account)}`);
-        void loadTokenState(true);
+        void loadTokens();
       }
     };
     ws.onclose = () => {
@@ -7754,17 +7879,23 @@ function wireConfigPanel() {
   $2("cfgSave").onclick = async () => {
     const val = (id) => $2(id).value.trim();
     const decimals = cfg.decimals ?? 6;
-    const tokenId = val("cfgTokenId").toLowerCase();
+    const ids = val("cfgTokenId").toLowerCase().split(/[,\s]+/).filter(Boolean);
     const priceToken = val("cfgPriceToken");
     const priceXno = val("cfgPriceXno");
+    const symbols = val("cfgSymbol").split(/[,\s]+/).filter(Boolean);
+    const accept = ids.map((tokenId, i) => ({
+      tokenId,
+      symbol: symbols[i] ?? symbols[0] ?? "",
+      decimals,
+      price: toRaw(priceToken, decimals).toString()
+    }));
     const body = {
       policy: {
         merchant: val("cfgMerchant"),
         resource: val("cfgResource"),
         title: val("cfgTitle"),
         description: val("cfgDesc"),
-        token: tokenId ? { tokenId, symbol: val("cfgSymbol"), decimals } : void 0,
-        priceToken: tokenId && priceToken ? toRaw(priceToken, decimals).toString() : void 0,
+        accept: priceToken ? accept : [],
         priceXno: priceXno ? toRaw(priceXno, 30).toString() : void 0,
         autoswap: $2("cfgAutoswap").checked,
         expires: 0

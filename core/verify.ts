@@ -19,7 +19,7 @@
 
 import { assembleFrag, isFragA } from "../vendor/hodl/core/fraglink.ts";
 import type { Policy } from "./policy.ts";
-import { policyIsIntact, priceOf, acceptsToken, acceptsXno } from "./policy.ts";
+import { policyIsIntact, priceXnoOf, acceptedToken, acceptedTokens, acceptsToken, acceptsXno } from "./policy.ts";
 import { grantId, isReceiptLink } from "./proof.ts";
 import {
   type ChainReader,
@@ -44,6 +44,9 @@ export interface Verdict {
   /** Amount moved, in raw (XNO) or the token's smallest unit. */
   paid?: string;
   price?: string;
+  /** Which token paid, when the token lane applied. */
+  tokenId?: string;
+  symbol?: string;
   /** Both blocks confirmed by the node. A grant requires it. */
   confirmed: boolean;
   /** Receipt block's first-seen time (unix seconds), 0 if unknown. */
@@ -145,6 +148,9 @@ interface Lane {
   paid: bigint;
   price: bigint;
   payment: string;
+  /** Which token was actually paid (token lane only). */
+  tokenId?: string;
+  symbol?: string;
   /** Set when the lane itself already failed for a specific, reportable reason. */
   fail?: string;
 }
@@ -159,6 +165,8 @@ function finish(policy: Policy, lane: Lane, confirmed: boolean, base: Partial<Ve
     payment: lane.payment,
     paid: lane.paid.toString(),
     price: lane.price.toString(),
+    tokenId: lane.tokenId,
+    symbol: lane.symbol,
     ...base,
   };
   if (lane.fail) return { ...common, reason: lane.fail };
@@ -176,7 +184,7 @@ function finish(policy: Policy, lane: Lane, confirmed: boolean, base: Partial<Ve
 async function xnoLane(policy: Policy, payment: VerifiedBlock, reader: ChainReader): Promise<Lane | null> {
   const dest = linkAsAddress(payment.link);
   if (!dest || !sameAccount(dest, policy.merchant)) return null; // not an XNO payment to us
-  const price = priceOf(policy, "XNO");
+  const price = priceXnoOf(policy);
   if (price == null) {
     return { asset: "XNO", paid: 0n, price: 0n, payment: payment.hash, fail: "this offer does not accept XNO" };
   }
@@ -221,45 +229,54 @@ async function tokenLane(
   }
   if (assembled.op?.kind !== "transfer") return null;
 
-  const price = priceOf(policy, "TOKEN");
-  if (price == null || !acceptsToken(policy)) {
+  if (!acceptsToken(policy)) {
     return { asset: "TOKEN", paid: 0n, price: 0n, payment: fragB.hash, fail: "this offer does not accept tokens" };
   }
-  const want = policy.token!.tokenId.toLowerCase();
-  if (assembled.tokenId.toLowerCase() !== want) {
+  // Which token was paid decides which price applies. An offer may list many,
+  // each at its own price -- there is no cross-token conversion anywhere in
+  // this function, because a token's quoted AMM value is a free declaration
+  // (see core/policy.ts) and pricing off it would be an open vault.
+  const paidId = assembled.tokenId.toLowerCase();
+  const entry = acceptedToken(policy, paidId);
+  if (!entry) {
+    const listed = acceptedTokens(policy)
+      .map((a) => a.symbol || a.tokenId.slice(0, 8))
+      .join(", ");
     return {
       asset: "TOKEN",
       paid: 0n,
-      price,
+      price: 0n,
       payment: fragB.hash,
-      fail: `wrong token: paid ${assembled.tokenId.slice(0, 10)} but this offer wants ${want.slice(0, 10)}`,
+      fail: `wrong token: paid ${paidId.slice(0, 10)}, this offer takes ${listed}`,
+      tokenId: paidId,
     };
   }
+  const price = BigInt(entry.price);
   if (!sameAccount(assembled.op.to, policy.merchant)) {
-    return { asset: "TOKEN", paid: 0n, price, payment: fragB.hash, fail: "token transfer was sent to a different address" };
+    return {
+      asset: "TOKEN", paid: 0n, price, payment: fragB.hash,
+      tokenId: paidId, symbol: entry.symbol,
+      fail: "token transfer was sent to a different address",
+    };
   }
 
   const amount: bigint = assembled.op.amount;
   if (!reader.tokenOpApplied) {
     return {
-      asset: "TOKEN",
-      paid: amount,
-      price,
-      payment: fragB.hash,
+      asset: "TOKEN", paid: amount, price, payment: fragB.hash,
+      tokenId: paidId, symbol: entry.symbol,
       fail: "this verifier cannot replay the token ledger, so a token payment cannot be proven here",
     };
   }
   const applied = await reader.tokenOpApplied(assembled.tokenId, fragA.hash);
   if (!applied.applied) {
     return {
-      asset: "TOKEN",
-      paid: amount,
-      price,
-      payment: fragB.hash,
+      asset: "TOKEN", paid: amount, price, payment: fragB.hash,
+      tokenId: paidId, symbol: entry.symbol,
       fail: `token transfer is signed but did not apply in the ledger: ${applied.reason}`,
     };
   }
-  return { asset: "TOKEN", paid: amount, price, payment: fragB.hash };
+  return { asset: "TOKEN", paid: amount, price, payment: fragB.hash, tokenId: paidId, symbol: entry.symbol };
 }
 
 /** Which lanes this policy will accept at all -- for the UI. */

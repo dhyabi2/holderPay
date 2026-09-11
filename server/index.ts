@@ -17,12 +17,21 @@ import * as crypto from "node:crypto";
 
 import { loadEnv, env } from "../core/env.ts";
 import { rpc, NANO_WS } from "../core/rpc.ts";
-import { makePolicy, policyIsIntact, type Policy, type PolicyInput } from "../core/policy.ts";
+import {
+  makePolicy,
+  policyIsIntact,
+  acceptedTokens,
+  swapTarget,
+  normalizeAccept,
+  type Policy,
+  type PolicyInput,
+} from "../core/policy.ts";
 import { verifyPayment, lanesOf, type Verdict } from "../core/verify.ts";
 import { memoLink, authDigest, verifyAuth, grantId } from "../core/proof.ts";
 import { addressToPub, isNanoAddress } from "../core/block.ts";
 import { NodeReader } from "../core/reader.ts";
 import { currentFold, stateOf } from "../core/ledger.ts";
+import { tokenList, viewToken, type SortKey, type TokenLabels } from "../core/valuation.ts";
 import { planSwap, quoteBuy } from "../core/swap.ts";
 import { ANCHOR_PUB } from "../vendor/hodl/core/anchor.ts";
 import * as catalog from "./catalog.ts";
@@ -153,6 +162,30 @@ function resolvePolicy(body: any): { policy: Policy | null; error?: string } {
   return { policy: listing.policy };
 }
 
+
+/**
+ * Display labels for tokens, from local sources only: TOKEN_LABELS in .env and
+ * the symbols merchants put in their own accept lists. Never from a registry --
+ * a name is display, and nothing here is allowed to decide a payment.
+ */
+function tokenLabels(): TokenLabels {
+  const labels: TokenLabels = new Map();
+  try {
+    for (const [id, v] of Object.entries<any>(JSON.parse(env("TOKEN_LABELS", "{}")))) {
+      labels.set(id.toLowerCase(), typeof v === "string" ? { symbol: v } : v);
+    }
+  } catch {
+    /* malformed TOKEN_LABELS is a config typo, not a reason to fail a request */
+  }
+  if (TOKEN_ID) labels.set(TOKEN_ID.toLowerCase(), { symbol: "TEACHER", name: "Teacher" });
+  for (const l of catalog.list()) {
+    for (const a of acceptedTokens(l.policy)) {
+      if (a.symbol && !labels.has(a.tokenId)) labels.set(a.tokenId, { symbol: a.symbol });
+    }
+  }
+  return labels;
+}
+
 // ── the server ──────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
@@ -180,6 +213,9 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         ws: NANO_WS,
         rpc: "/api/rpc",
+        // A convenience default for the merchant form. The app is NOT limited
+        // to it: an offer may list any hodlgame token, and /api/tokens returns
+        // everything this verifier can see.
         tokenId: TOKEN_ID,
         symbol: "TEACHER",
         decimals: 6,
@@ -216,6 +252,8 @@ const server = http.createServer(async (req, res) => {
         listings: catalog.list().map((l) => ({
           policy: l.policy,
           lanes: lanesOf(l.policy),
+          accept: acceptedTokens(l.policy),
+          swapInto: swapTarget(l.policy),
           receiptLink: memoLink(l.policy.id),
         })),
       });
@@ -230,6 +268,12 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const input = body?.policy as PolicyInput;
       if (!input || !isNanoAddress(input.merchant ?? "")) return json(res, 400, { error: "merchant address required" });
+      // normalizeAccept drops malformed or non-positive entries and de-dupes by
+      // token id, so a published offer can never carry a token priced at zero.
+      const accept = normalizeAccept(input.accept).slice(0, 50);
+      if (accept.length === 0 && !input.priceXno) {
+        return json(res, 400, { error: "an offer must accept XNO, at least one token, or both" });
+      }
       const listing = catalog.put(
         {
           merchant: input.merchant,
@@ -237,9 +281,9 @@ const server = http.createServer(async (req, res) => {
           title: String(input.title ?? "").slice(0, 200),
           description: String(input.description ?? "").slice(0, 2000),
           priceXno: input.priceXno ? BigInt(input.priceXno).toString() : undefined,
-          priceToken: input.priceToken ? BigInt(input.priceToken).toString() : undefined,
-          token: input.token,
+          accept,
           autoswap: !!input.autoswap,
+          swapInto: input.swapInto ? String(input.swapInto).toLowerCase() : undefined,
           expires: Number(input.expires) || 0,
         },
         String(body?.unlock ?? "").slice(0, 20000)
@@ -251,29 +295,43 @@ const server = http.createServer(async (req, res) => {
     if (route === "GET /api/policy") {
       const l = catalog.get(url.searchParams.get("id") ?? "");
       if (!l) return json(res, 404, { error: "unknown policy" });
-      return json(res, 200, { policy: l.policy, lanes: lanesOf(l.policy), receiptLink: memoLink(l.policy.id) });
+      return json(res, 200, {
+        policy: l.policy,
+        lanes: lanesOf(l.policy),
+        accept: acceptedTokens(l.policy),
+        swapInto: swapTarget(l.policy),
+        receiptLink: memoLink(l.policy.id),
+      });
     }
 
-    // ---- token state (for quoting and display) -----------------------------
+    // ---- tokens ----------------------------------------------------------
+    // Every token this verifier can see, sorted. The default order is by what
+    // the given account holds measured against REAL COLLATERAL, never by the
+    // AMM quote: a token's quoted price is a free declaration (three raw buys
+    // one quoting a million XNO), so ordering by it would put the cheapest lie
+    // on top. See core/valuation.ts.
+    if (route === "GET /api/tokens") {
+      const account = url.searchParams.get("account") ?? "";
+      const sort = (url.searchParams.get("sort") ?? "backedHoldingValue") as SortKey;
+      const held = url.searchParams.get("held") === "1";
+      const f = await currentFold(account ? [account] : []);
+      let tokens = tokenList(f, account, sort, tokenLabels());
+      if (held && account) tokens = tokens.filter((t) => BigInt(t.balance) > 0n);
+      return json(res, 200, { tokens, watched: f.accounts.length, foldAt: f.at, sort });
+    }
+
+    // ---- one token's state (for quoting and display) -----------------------
     if (route === "GET /api/token") {
       const account = url.searchParams.get("account") ?? "";
       const tokenId = (url.searchParams.get("tokenId") || TOKEN_ID).toLowerCase();
-      if (!tokenId) return json(res, 400, { error: "no token configured" });
+      if (!tokenId) return json(res, 400, { error: "tokenId required" });
       const f = await currentFold(account ? [account] : []);
       const s = stateOf(f, tokenId);
       const head = s.queue.find((q) => q.owed > 0n) ?? null;
       return json(res, 200, {
-        tokenId,
+        ...viewToken(tokenId, s, account, tokenLabels()),
         launched: s.launched,
-        direct: s.direct,
-        symbol: s.symbol || "TEACHER",
-        decimals: s.decimals,
-        supply: s.supply,
-        treasury: s.treasury,
-        poolXno: s.poolXno,
-        poolTokens: s.poolTokens,
-        creator: s.creator,
-        holders: s.balances.size,
+        treasury: s.treasury.toString(),
         queueHead: head ? { account: head.account, owed: head.owed } : null,
         queueTotal: s.queue.reduce((a, q) => a + q.owed, 0n),
         you: account

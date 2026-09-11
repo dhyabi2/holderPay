@@ -4,6 +4,8 @@
 
 import { NanoRpcSource } from "../vendor/hodl/indexer/blockSource.ts";
 import { foldAccounts, watchSet, stateOf, opApplied, type Fold } from "./fold.ts";
+import { ANCHOR_PUB } from "../vendor/hodl/core/anchor.ts";
+import * as nanocurrency from "nanocurrency";
 import { env, loadEnv } from "./env.ts";
 import { rpcKey } from "./rpc.ts";
 
@@ -15,13 +17,28 @@ loadEnv();
  * plus anything the caller names, plus WATCH_EXTRA for accounts that traded the
  * token outside holderPay. */
 function seeds(extra: string[]): string[] {
-  return [
+  const list = [
     env("CREATOR_ADDRESS"),
     env("MERCHANT_ADDRESS"),
     env("HOLDERPAY_ANCHOR_ADDRESS"),
     ...extra,
     ...env("WATCH_EXTRA").split(/[,\s]+/).filter(Boolean),
-  ].filter(Boolean);
+  ];
+  // Opt-in wider discovery. holderPay's own anchor only knows accounts that
+  // used holderPay; hodlgame's anchor knows everyone who ever launched or
+  // traded ANY token, which is what makes "accept all tokens" mean the whole
+  // universe rather than just ours. It is off by default because folding that
+  // many chains is slow, and discovery only ever ADDS candidates -- replay
+  // still validates every op on its own merits, so a wider set changes how
+  // much we can see, never what is true.
+  if (env("DISCOVER_HODLGAME") === "1") {
+    try {
+      list.push(nanocurrency.deriveAddress(ANCHOR_PUB, { useNanoPrefix: true }));
+    } catch {
+      /* malformed anchor constant: skip rather than fail the fold */
+    }
+  }
+  return list.filter(Boolean);
 }
 
 export async function fold(extraAccounts: string[] = []): Promise<Fold> {

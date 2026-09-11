@@ -51,7 +51,7 @@ function carriersOf(e: IndexedEvent): string[] {
  * a fake one to pass -- but it does mean this fold can lag a wider indexer's
  * view. Pass the accounts you know about in `seeds`.
  */
-export async function watchSet(reader: CounterpartyReader, seeds: string[]): Promise<string[]> {
+export async function watchSet(reader: CounterpartyReader, seeds: string[], cap = 400): Promise<string[]> {
   const set = new Set<string>(seeds.filter(Boolean));
   const hops = await Promise.all(
     seeds.filter(Boolean).map(async (a) => {
@@ -66,7 +66,19 @@ export async function watchSet(reader: CounterpartyReader, seeds: string[]): Pro
     for (const h of cp.inbound) set.add(h.sender);
     for (const a of cp.outbound) set.add(a);
   }
-  return [...set].filter(Boolean).sort();
+  // A hard cap, because discovery from a public anchor is attacker-influenced:
+  // anyone can greet it and add themselves to the set for one raw. Without a
+  // bound, a few thousand spam hellos would turn every verify into a chain walk
+  // over thousands of accounts. The seeds are kept unconditionally (they are
+  // the accounts we actually care about); discovered extras fill what is left,
+  // in sorted order so every replayer truncates identically.
+  const kept = new Set(seeds.filter(Boolean));
+  const discovered = [...set].filter((a) => a && !kept.has(a)).sort();
+  for (const a of discovered) {
+    if (kept.size >= cap) break;
+    kept.add(a);
+  }
+  return [...kept].filter(Boolean).sort();
 }
 
 /** Fold the given accounts' chains into token state. Pure given the blocks. */
