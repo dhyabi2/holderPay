@@ -18,7 +18,7 @@ import { encodeOpLink } from "../vendor/hodl/core/oplink.ts";
 import { encodeFragLinks } from "../vendor/hodl/core/fraglink.ts";
 import { tokenIdFromLaunchHash } from "../vendor/hodl/core/token.ts";
 import { ANCHOR_PUB } from "../vendor/hodl/core/anchor.ts";
-import { keysFromSeed, receiveAll, submitLink, tip, toRaw, fromRaw, XNO } from "../core/wallet.ts";
+import { keysFromSeed, receiveAll, submitLink, tip, toRaw, fromRaw, waitForReceivable, XNO } from "../core/wallet.ts";
 
 loadEnv();
 

@@ -13,7 +13,18 @@
 
 import { loadEnv, env } from "../core/env.ts";
 import { rpc as nodeRpc } from "../core/rpc.ts";
-import { keysFromSeed, receiveAll, sendXno, submitLink, tip, toRaw, fromRaw, XNO, type Keys } from "../core/wallet.ts";
+import {
+  keysFromSeed,
+  receiveAll,
+  sendXno,
+  submitLink,
+  tip,
+  toRaw,
+  fromRaw,
+  waitForReceivable,
+  XNO,
+  type Keys,
+} from "../core/wallet.ts";
 import { makePolicy, type Policy } from "../core/policy.ts";
 import { memoLink, signAuth, verifyAuth } from "../core/proof.ts";
 import { verifyPayment, type Verdict } from "../core/verify.ts";
@@ -140,9 +151,17 @@ async function setup() {
     if (c.balance < topUp + 1000n) throw new Error("creator cannot cover the buyer top-up");
     const h = await sendXno(nodeRpc, creator, buyer.address, topUp);
     console.log(`  funded buyer with ${fromRaw(topUp, 30)} XNO (${h.slice(0, 12)}…)`);
+    // A send is not receivable the moment `process` returns -- the network has
+    // to confirm it first. Waiting here is the difference between an opened
+    // wallet and a confusing "wallet is unopened" three lines later.
+    const arrived = await waitForReceivable(nodeRpc, buyer.address, topUp, 90_000, (ms) =>
+      console.log(`  waiting for the funding block to become receivable (${Math.round(ms / 1000)}s)…`)
+    );
+    if (!arrived) throw new Error("the buyer top-up never became receivable -- network or endpoint issue");
     const got = await receiveAll(nodeRpc, buyer);
     console.log(`  buyer received ${got.count} block(s)`);
     b = await tip(nodeRpc, buyer.address);
+    if (!b.frontier) throw new Error("buyer wallet is still unopened after receiving");
   }
   console.log(`  buyer balance   ${fromRaw(b.balance, 30)} XNO`);
   await ensureHellos(buyer, "buyer");

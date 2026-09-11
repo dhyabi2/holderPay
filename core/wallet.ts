@@ -125,6 +125,40 @@ export async function sendXno(rpc: Rpc, keys: Keys, to: string, raw: bigint): Pr
   return submitLink(rpc, keys, nanocurrency.derivePublicKey(to), raw);
 }
 
+/**
+ * Wait until `account` has something receivable worth at least `min` raw.
+ *
+ * A Nano send is not receivable by the destination the instant `process`
+ * returns -- the answering node has to confirm it and the destination's view has
+ * to catch up. Calling receiveAll immediately after a send therefore finds
+ * nothing and silently leaves the wallet unopened, which is exactly what broke
+ * the first live e2e run. Resolves false on timeout rather than throwing, so
+ * callers can report a useful message instead of a stack trace.
+ */
+export async function waitForReceivable(
+  rpc: Rpc,
+  account: string,
+  min = 1n,
+  timeoutMs = 60_000,
+  onWait?: (elapsedMs: number) => void
+): Promise<boolean> {
+  const started = Date.now();
+  for (;;) {
+    try {
+      const r = await rpc({ action: "receivable", account, count: "50", source: "true", threshold: "1" });
+      const blocks = r?.blocks && typeof r.blocks === "object" ? r.blocks : {};
+      let total = 0n;
+      for (const v of Object.values<any>(blocks)) total += BigInt(typeof v === "string" ? v : v.amount);
+      if (total >= min) return true;
+    } catch {
+      /* unopened accounts answer with an error; keep waiting */
+    }
+    if (Date.now() - started > timeoutMs) return false;
+    onWait?.(Date.now() - started);
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+}
+
 /** Receive every receivable block so incoming XNO becomes spendable. */
 export async function receiveAll(rpc: Rpc, keys: Keys): Promise<{ count: number; balance: bigint }> {
   const r = await rpc({ action: "receivable", account: keys.address, count: "50", source: "true", threshold: "1" });

@@ -14,7 +14,8 @@
     "verify": "node --experimental-strip-types scripts/verify.ts",
     "await-funding": "node --experimental-strip-types scripts/await-funding.ts",
     "e2e": "node --experimental-strip-types scripts/e2e.ts",
-    "test": "node --experimental-strip-types --test core/*.test.ts"
+    "test": "node --experimental-strip-types --test core/*.test.ts",
+    "live-checkout": "node --experimental-strip-types scripts/live-checkout.ts"
   },
   "dependencies": {
     "blakejs": "^1.2.1",
