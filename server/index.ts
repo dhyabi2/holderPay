@@ -54,17 +54,48 @@ const ALLOWED_ACTIONS = new Set([
   "version",
 ]);
 
-// Crude per-IP limiter: enough to stop a stray loop from burning the RPC quota.
+// `work_generate` is the expensive one and needs its own, much tighter budget.
+// Proof-of-work cost is exponential in the difficulty bits, and when
+// rpc.nano.to is slow core/rpc.ts falls back to generating it on THIS machine's
+// CPU. Under the general read limit, one client could pin every core and stall
+// the event loop for everyone -- a denial of service that costs the attacker a
+// for-loop. A legitimate payment needs two or three nonces, so a handful a
+// minute is generous, and a global cap bounds the damage from a botnet.
+const WORK_PER_IP_PER_MIN = 12;
+const WORK_GLOBAL_PER_MIN = 120;
+
+// Crude per-key limiter: enough to stop a stray loop, or a cheap DoS, from
+// burning the RPC quota or the CPU. In-memory, so it resets on restart and does
+// not span instances -- adequate for one box, not for a fleet.
 const hits = new Map<string, { n: number; until: number }>();
-function rateLimit(ip: string, max: number, windowMs: number): boolean {
+function rateLimit(key: string, max: number, windowMs: number): boolean {
   const now = Date.now();
-  const h = hits.get(ip);
+  const h = hits.get(key);
   if (!h || now > h.until) {
-    hits.set(ip, { n: 1, until: now + windowMs });
+    hits.set(key, { n: 1, until: now + windowMs });
     return true;
   }
   h.n++;
   return h.n <= max;
+}
+
+// Catalog writes are shop ADMINISTRATION, not part of the trust model: no
+// grant depends on them, and a forged offer cannot mint access for anyone.
+// They still must not be open to the world, or a stranger can spam your shop
+// listing or rewrite what an existing offer hands over. Set ADMIN_TOKEN in
+// .env to enable them; without it the endpoint is closed unless the operator
+// explicitly asks for dev mode.
+const ADMIN_TOKEN = env("ADMIN_TOKEN");
+const DEV_OPEN_CATALOG = env("HOLDERPAY_DEV") === "1";
+
+function adminOk(req: http.IncomingMessage): boolean {
+  if (!ADMIN_TOKEN) return DEV_OPEN_CATALOG;
+  const given = String(req.headers["x-admin-token"] ?? "");
+  // Constant-time compare: a length-leaking early return turns a secret into a
+  // few thousand guesses.
+  const a = Buffer.from(given);
+  const b = Buffer.from(ADMIN_TOKEN);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 // ── challenges (for proving control of the paying account) ───────────────────
@@ -165,6 +196,11 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const action = String(body?.action ?? "");
       if (!ALLOWED_ACTIONS.has(action)) return json(res, 400, { error: `action not allowed: ${action}` });
+      if (action === "work_generate") {
+        if (!rateLimit(`work:${ip}`, WORK_PER_IP_PER_MIN, 60_000) || !rateLimit("work:global", WORK_GLOBAL_PER_MIN, 60_000)) {
+          return json(res, 429, { error: "too many proof-of-work requests -- try again in a minute" });
+        }
+      }
       try {
         return json(res, 200, await rpc(body));
       } catch (e: any) {
@@ -186,6 +222,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (route === "POST /api/policies") {
+      if (!adminOk(req)) {
+        return json(res, 403, {
+          error: "publishing offers is disabled -- set ADMIN_TOKEN in .env and send it as x-admin-token (or HOLDERPAY_DEV=1 for a local demo)",
+        });
+      }
       const body = await readBody(req);
       const input = body?.policy as PolicyInput;
       if (!input || !isNanoAddress(input.merchant ?? "")) return json(res, 400, { error: "merchant address required" });
@@ -296,7 +337,7 @@ const server = http.createServer(async (req, res) => {
       // The honest-server tamper demo. A real attacker would not add a query
       // parameter -- they would just patch this handler. The page's independent
       // check catches both identically, which is exactly the claim being made.
-      if (url.searchParams.get("forge") === "1") {
+      if (url.searchParams.get("forge") === "1" && (DEV_OPEN_CATALOG || env("HOLDERPAY_ALLOW_FORGE") === "1")) {
         const forged: Verdict = {
           ...verdict,
           granted: true,
