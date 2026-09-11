@@ -19,7 +19,7 @@
 
 import { assembleFrag, isFragA } from "../vendor/hodl/core/fraglink.ts";
 import type { Policy } from "./policy.ts";
-import { policyIsIntact, priceXnoOf, acceptedToken, acceptedTokens, acceptsToken, acceptsXno } from "./policy.ts";
+import { policyIsIntact, priceXnoOf, acceptedToken, acceptedTokens, acceptsToken, acceptsXno, acceptAnyOf } from "./policy.ts";
 import { grantId, isReceiptLink } from "./proof.ts";
 import {
   type ChainReader,
@@ -238,7 +238,8 @@ async function tokenLane(
   // (see core/policy.ts) and pricing off it would be an open vault.
   const paidId = assembled.tokenId.toLowerCase();
   const entry = acceptedToken(policy, paidId);
-  if (!entry) {
+  const open = entry ? null : acceptAnyOf(policy);
+  if (!entry && !open) {
     const listed = acceptedTokens(policy)
       .map((a) => a.symbol || a.tokenId.slice(0, 8))
       .join(", ");
@@ -251,11 +252,14 @@ async function tokenLane(
       tokenId: paidId,
     };
   }
-  const price = BigInt(entry.price);
+  // A listed token has a price the merchant chose. An unlisted one, on an offer
+  // that takes anything, is priced by COLLATERAL instead -- see AcceptAny in
+  // core/policy.ts for why it cannot be priced by the token's own quote.
+  const price = entry ? BigInt(entry.price) : BigInt(open!.priceXno);
   if (!sameAccount(assembled.op.to, policy.merchant)) {
     return {
       asset: "TOKEN", paid: 0n, price, payment: fragB.hash,
-      tokenId: paidId, symbol: entry.symbol,
+      tokenId: paidId, symbol: entry?.symbol,
       fail: "token transfer was sent to a different address",
     };
   }
@@ -264,7 +268,7 @@ async function tokenLane(
   if (!reader.tokenOpApplied) {
     return {
       asset: "TOKEN", paid: amount, price, payment: fragB.hash,
-      tokenId: paidId, symbol: entry.symbol,
+      tokenId: paidId, symbol: entry?.symbol,
       fail: "this verifier cannot replay the token ledger, so a token payment cannot be proven here",
     };
   }
@@ -272,11 +276,50 @@ async function tokenLane(
   if (!applied.applied) {
     return {
       asset: "TOKEN", paid: amount, price, payment: fragB.hash,
-      tokenId: paidId, symbol: entry.symbol,
+      tokenId: paidId, symbol: entry?.symbol,
       fail: `token transfer is signed but did not apply in the ledger: ${applied.reason}`,
     };
   }
-  return { asset: "TOKEN", paid: amount, price, payment: fragB.hash, tokenId: paidId, symbol: entry.symbol };
+  // A listed token is measured in its own units against its own price, and we
+  // are done. An unlisted one has to be valued, and the ONLY honest yardstick
+  // is the collateral its share represents.
+  if (entry) {
+    return { asset: "TOKEN", paid: amount, price, payment: fragB.hash, tokenId: paidId, symbol: entry.symbol };
+  }
+
+  const common = { asset: "TOKEN" as const, payment: fragB.hash, tokenId: paidId, price };
+  if (!reader.tokenBacking) {
+    return {
+      ...common,
+      paid: 0n,
+      fail: "this verifier cannot value tokens, so a payment in an unlisted token cannot be proven here",
+    };
+  }
+  const b = await reader.tokenBacking(paidId);
+  if (!b || b.circulating <= 0n) {
+    return { ...common, paid: 0n, fail: `token ${paidId.slice(0, 10)} has no circulating supply to value` };
+  }
+  if (b.backing <= 0n) {
+    return {
+      ...common,
+      paid: 0n,
+      fail: `token ${paidId.slice(0, 10)} has no collateral behind it, so no amount of it is worth anything here`,
+    };
+  }
+  const minBacking = BigInt(open!.minBacking ?? "0");
+  if (b.backing < minBacking) {
+    return {
+      ...common,
+      paid: 0n,
+      fail: `token ${paidId.slice(0, 10)} is backed by ${b.backing} raw, under this offer's minimum of ${minBacking}`,
+    };
+  }
+
+  // Pro-rata share of real collateral. Integer division rounds DOWN, which
+  // rounds against the payer by at most one raw -- the direction that can only
+  // ever refuse a payment, never grant a short one.
+  const backedValue = (b.backing * amount) / b.circulating;
+  return { ...common, paid: backedValue, symbol: undefined };
 }
 
 /** Which lanes this policy will accept at all -- for the UI. */

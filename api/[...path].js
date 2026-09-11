@@ -3228,6 +3228,7 @@ function hashableV1(p) {
 }
 function hashableV2(p) {
   const accept = normalizeAccept(p.accept);
+  const any = normalizeAcceptAny(p.acceptAny);
   return {
     v: 2,
     merchant: p.merchant,
@@ -3243,7 +3244,13 @@ function hashableV2(p) {
     })),
     autoswap: !!p.autoswap,
     swapInto: (p.swapInto ?? "").toLowerCase(),
-    expires: Math.floor(p.expires) || 0
+    expires: Math.floor(p.expires) || 0,
+    // Included ONLY when set. An offer published before this existed must keep
+    // hashing to the id it already has -- its receipts are on chain and its
+    // buyers' grants are derived from that id, so adding a key unconditionally
+    // would revoke access people have paid for. Tampering is still caught: an
+    // acceptAny added or stripped in transit changes the hash either way.
+    ...any ? { acceptAny: { priceXno: any.priceXno, minBacking: any.minBacking ?? "0" } } : {}
   };
 }
 function normalizeAccept(list2) {
@@ -3274,7 +3281,7 @@ function policyId(p) {
 }
 function makePolicy(p) {
   const v = p.v ?? 2;
-  const base = v === 2 ? { ...p, accept: normalizeAccept(p.accept) } : p;
+  const base = v === 2 ? { ...p, accept: normalizeAccept(p.accept), acceptAny: normalizeAcceptAny(p.acceptAny) ?? void 0 } : p;
   return { ...base, v, id: policyId({ ...base, v }) };
 }
 function policyIsIntact(p) {
@@ -3309,7 +3316,24 @@ function acceptsXno(p) {
   return !!p.priceXno && BigInt(p.priceXno) > 0n;
 }
 function acceptsToken(p) {
-  return acceptedTokens(p).length > 0;
+  return acceptedTokens(p).length > 0 || acceptAnyOf(p) !== null;
+}
+function normalizeAcceptAny(a) {
+  if (!a) return null;
+  let price;
+  let min;
+  try {
+    price = BigInt(a.priceXno ?? "0");
+    min = BigInt(a.minBacking ?? "0");
+  } catch {
+    return null;
+  }
+  if (price <= 0n || min < 0n) return null;
+  return { priceXno: price.toString(), minBacking: min.toString() };
+}
+function acceptAnyOf(p) {
+  if ((p.v ?? 2) === 1) return null;
+  return normalizeAcceptAny(p.acceptAny);
 }
 function priceXnoOf(p) {
   return acceptsXno(p) ? BigInt(p.priceXno) : null;
@@ -3566,7 +3590,8 @@ async function tokenLane(policy, receipt, fragB, reader) {
   }
   const paidId = assembled.tokenId.toLowerCase();
   const entry = acceptedToken(policy, paidId);
-  if (!entry) {
+  const open = entry ? null : acceptAnyOf(policy);
+  if (!entry && !open) {
     const listed = acceptedTokens(policy).map((a) => a.symbol || a.tokenId.slice(0, 8)).join(", ");
     return {
       asset: "TOKEN",
@@ -3577,7 +3602,7 @@ async function tokenLane(policy, receipt, fragB, reader) {
       tokenId: paidId
     };
   }
-  const price = BigInt(entry.price);
+  const price = entry ? BigInt(entry.price) : BigInt(open.priceXno);
   if (!sameAccount(assembled.op.to, policy.merchant)) {
     return {
       asset: "TOKEN",
@@ -3585,7 +3610,7 @@ async function tokenLane(policy, receipt, fragB, reader) {
       price,
       payment: fragB.hash,
       tokenId: paidId,
-      symbol: entry.symbol,
+      symbol: entry?.symbol,
       fail: "token transfer was sent to a different address"
     };
   }
@@ -3597,7 +3622,7 @@ async function tokenLane(policy, receipt, fragB, reader) {
       price,
       payment: fragB.hash,
       tokenId: paidId,
-      symbol: entry.symbol,
+      symbol: entry?.symbol,
       fail: "this verifier cannot replay the token ledger, so a token payment cannot be proven here"
     };
   }
@@ -3609,11 +3634,42 @@ async function tokenLane(policy, receipt, fragB, reader) {
       price,
       payment: fragB.hash,
       tokenId: paidId,
-      symbol: entry.symbol,
+      symbol: entry?.symbol,
       fail: `token transfer is signed but did not apply in the ledger: ${applied.reason}`
     };
   }
-  return { asset: "TOKEN", paid: amount, price, payment: fragB.hash, tokenId: paidId, symbol: entry.symbol };
+  if (entry) {
+    return { asset: "TOKEN", paid: amount, price, payment: fragB.hash, tokenId: paidId, symbol: entry.symbol };
+  }
+  const common = { asset: "TOKEN", payment: fragB.hash, tokenId: paidId, price };
+  if (!reader.tokenBacking) {
+    return {
+      ...common,
+      paid: 0n,
+      fail: "this verifier cannot value tokens, so a payment in an unlisted token cannot be proven here"
+    };
+  }
+  const b = await reader.tokenBacking(paidId);
+  if (!b || b.circulating <= 0n) {
+    return { ...common, paid: 0n, fail: `token ${paidId.slice(0, 10)} has no circulating supply to value` };
+  }
+  if (b.backing <= 0n) {
+    return {
+      ...common,
+      paid: 0n,
+      fail: `token ${paidId.slice(0, 10)} has no collateral behind it, so no amount of it is worth anything here`
+    };
+  }
+  const minBacking = BigInt(open.minBacking ?? "0");
+  if (b.backing < minBacking) {
+    return {
+      ...common,
+      paid: 0n,
+      fail: `token ${paidId.slice(0, 10)} is backed by ${b.backing} raw, under this offer's minimum of ${minBacking}`
+    };
+  }
+  const backedValue = b.backing * amount / b.circulating;
+  return { ...common, paid: backedValue, symbol: void 0 };
 }
 function lanesOf(policy) {
   const out = [];
@@ -5510,47 +5566,15 @@ function bustFold() {
   cached = null;
 }
 
-// core/reader.ts
-var NodeReader = class {
-  // Per-instance memo: one verify call touches the receipt, the payment and
-  // (token lane) the fragment underneath it, and the balance check walks back
-  // one more. Re-fetching the same hash within a call is pure waste.
-  memo = /* @__PURE__ */ new Map();
-  extraAccounts;
-  constructor(extraAccounts = []) {
-    this.extraAccounts = extraAccounts;
-  }
-  async getBlock(hash) {
-    const key = (hash ?? "").toUpperCase();
-    if (this.memo.has(key)) return this.memo.get(key);
-    const got = (await getBlocks([key])).get(key) ?? null;
-    this.memo.set(key, got);
-    return got;
-  }
-  /** Prefetch several hashes in one RPC round-trip. */
-  async warm(hashes) {
-    const want = hashes.map((h) => h.toUpperCase()).filter((h) => !this.memo.has(h));
-    if (want.length === 0) return;
-    const got = await getBlocks(want);
-    for (const h of want) this.memo.set(h, got.get(h) ?? null);
-  }
-  async tokenOpApplied(tokenId, carrierHash) {
-    const f = await currentFold(this.extraAccounts);
-    return opApplied(f, tokenId, carrierHash);
-  }
-  /** Token balance as this verifier computes it. For display, not verdicts. */
-  async tokenBalance(tokenId, account) {
-    const f = await currentFold(this.extraAccounts);
-    return stateOf(f, tokenId).balances.get(account) ?? 0n;
-  }
-};
-
 // core/valuation.ts
 var XNO = 10n ** 30n;
 function backingOf(s) {
   let total = 0n;
   for (const f of s.earmarkFloor.values()) total += f;
   return total;
+}
+function circulatingOf(s) {
+  return s.supply > s.treasury ? s.supply - s.treasury : 0n;
 }
 function quotedPriceOf(s) {
   if (s.poolTokens <= 0n || s.poolXno <= 0n) return 0n;
@@ -5562,7 +5586,7 @@ function viewToken(tokenId, s, account = "", labels) {
   const quotedValue = s.supply * quotedPrice / unit;
   const backing = backingOf(s);
   const balance = account ? s.balances.get(account) ?? 0n : 0n;
-  const circulating = s.supply > s.treasury ? s.supply - s.treasury : 0n;
+  const circulating = circulatingOf(s);
   const backedHoldingValue = circulating > 0n ? backing * balance / circulating : 0n;
   const label = labels?.get(tokenId.toLowerCase());
   return {
@@ -5579,6 +5603,7 @@ function viewToken(tokenId, s, account = "", labels) {
     quotedPrice: quotedPrice.toString(),
     quotedValue: quotedValue.toString(),
     backing: backing.toString(),
+    circulating: circulating.toString(),
     // Parts-per-million internally, reported as a percentage, so a real but
     // tiny ratio does not round away to a flat 0 and read like "unbacked".
     backedPct: quotedValue > 0n ? Number(backing * 1000000n / quotedValue) / 1e4 : null,
@@ -5609,6 +5634,48 @@ function tokenList(fold2, account = "", key = "backedHoldingValue", labels) {
   const views = tokens(fold2.state).map(({ tokenId, state }) => viewToken(tokenId, state, account, labels));
   return sortTokens(views, key);
 }
+
+// core/reader.ts
+var NodeReader = class {
+  // Per-instance memo: one verify call touches the receipt, the payment and
+  // (token lane) the fragment underneath it, and the balance check walks back
+  // one more. Re-fetching the same hash within a call is pure waste.
+  memo = /* @__PURE__ */ new Map();
+  extraAccounts;
+  constructor(extraAccounts = []) {
+    this.extraAccounts = extraAccounts;
+  }
+  async getBlock(hash) {
+    const key = (hash ?? "").toUpperCase();
+    if (this.memo.has(key)) return this.memo.get(key);
+    const got = (await getBlocks([key])).get(key) ?? null;
+    this.memo.set(key, got);
+    return got;
+  }
+  /** Prefetch several hashes in one RPC round-trip. */
+  async warm(hashes) {
+    const want = hashes.map((h) => h.toUpperCase()).filter((h) => !this.memo.has(h));
+    if (want.length === 0) return;
+    const got = await getBlocks(want);
+    for (const h of want) this.memo.set(h, got.get(h) ?? null);
+  }
+  async tokenOpApplied(tokenId, carrierHash) {
+    const f = await currentFold(this.extraAccounts);
+    return opApplied(f, tokenId, carrierHash);
+  }
+  /** Collateral behind a token, from this verifier's own replay. */
+  async tokenBacking(tokenId) {
+    const f = await currentFold(this.extraAccounts);
+    const s = stateOf(f, tokenId);
+    if (!s.launched) return null;
+    return { backing: backingOf(s), circulating: circulatingOf(s) };
+  }
+  /** Token balance as this verifier computes it. For display, not verdicts. */
+  async tokenBalance(tokenId, account) {
+    const f = await currentFold(this.extraAccounts);
+    return stateOf(f, tokenId).balances.get(account) ?? 0n;
+  }
+};
 
 // core/swap.ts
 var nanocurrency13 = __toESM(require_nanocurrency_cjs(), 1);
@@ -6385,6 +6452,33 @@ var catalog_baked_default = {
       },
       unlock: "Paid in TEACHER. The seller never touched XNO, and you never had to source the token in advance.",
       createdAt: 1789127222836
+    },
+    {
+      policy: {
+        merchant: "nano_177uaf8ucnokskie7nt5maanp3pqwnmmh8qowoujxi6c48htzyc1zsrcgnxf",
+        resource: "shop/any-token",
+        title: "Pay with any token you hold",
+        description: "Bring whatever token you have. What it is worth here is its share of REAL collateral -- the earmarked XNO behind it, which somebody had to actually hold -- not the price its own curve quotes. A token launched for three raw that claims to be worth a million cannot buy this, at any quantity.",
+        accept: [
+          {
+            tokenId: "cb9b91d6f52deb3541ae3988c42cb78b",
+            symbol: "TEACHER",
+            decimals: 6,
+            price: "1000000"
+          }
+        ],
+        priceXno: "10000000000000000000000000",
+        acceptAny: {
+          priceXno: "1000000000000000000000",
+          minBacking: "0"
+        },
+        autoswap: true,
+        expires: 0,
+        v: 2,
+        id: "d3d1ac006e39a0794a373ccf0f147118ae3538ddecb8614f4a6fb856bf2a6a77"
+      },
+      unlock: "Paid with a token nobody listed in advance.\n\nWhat made it acceptable was not its name, its picture, or the price its own AMM quotes -- all three are free to invent. It was the collateral behind it: earmarked XNO that consensus checks against the signed balance of a real wallet. That is why a token minted for three raw, quoting a million XNO a unit, buys exactly nothing here.",
+      createdAt: 1789144384171
     }
   ]
 };

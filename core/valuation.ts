@@ -51,6 +51,13 @@ export interface TokenView {
    */
   backing: string;
   /**
+   * Supply with a claim on that backing (treasury excluded). Published because
+   * a payer needs it: on an offer that takes any token, what is owed is derived
+   * from backing per circulating unit, and the page must be able to work that
+   * out for itself rather than ask the server what to pay.
+   */
+  circulating: string;
+  /**
    * backing / quotedValue as a percentage, or null when nothing is quoted.
    * A token quoting far more than it is backed by is not necessarily a scam --
    * a young token legitimately has little collateral yet -- but a merchant
@@ -74,6 +81,16 @@ export function backingOf(s: State): bigint {
   let total = 0n;
   for (const f of s.earmarkFloor.values()) total += f;
   return total;
+}
+
+/**
+ * Supply with a claim on the backing.
+ *
+ * The treasury is excluded because it was never issued: counting it would
+ * dilute every real holder's share against tokens nobody holds.
+ */
+export function circulatingOf(s: State): bigint {
+  return s.supply > s.treasury ? s.supply - s.treasury : 0n;
 }
 
 /** Raw XNO per ONE whole token, from the (freely declared) curve. */
@@ -105,7 +122,7 @@ export function viewToken(tokenId: string, s: State, account = "", labels?: Toke
   // Pro-rata share of real collateral. Circulating supply is what has claims on
   // it, so the treasury (never issued) is excluded -- otherwise an untouched
   // 95% treasury would dilute every real holder's backed value to near zero.
-  const circulating = s.supply > s.treasury ? s.supply - s.treasury : 0n;
+  const circulating = circulatingOf(s);
   const backedHoldingValue = circulating > 0n ? (backing * balance) / circulating : 0n;
 
   const label = labels?.get(tokenId.toLowerCase());
@@ -123,6 +140,7 @@ export function viewToken(tokenId: string, s: State, account = "", labels?: Toke
     quotedPrice: quotedPrice.toString(),
     quotedValue: quotedValue.toString(),
     backing: backing.toString(),
+    circulating: circulating.toString(),
     // Parts-per-million internally, reported as a percentage, so a real but
     // tiny ratio does not round away to a flat 0 and read like "unbacked".
     backedPct: quotedValue > 0n ? Number((backing * 1_000_000n) / quotedValue) / 10_000 : null,

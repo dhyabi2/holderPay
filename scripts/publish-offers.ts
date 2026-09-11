@@ -46,6 +46,39 @@ const offers = [
   {
     input: {
       merchant: MERCHANT,
+      resource: "shop/any-token",
+      title: "Pay with any token you hold",
+      description:
+        "Bring whatever token you have. What it is worth here is its share of REAL collateral -- the earmarked XNO behind it, which somebody had to actually hold -- not the price its own curve quotes. A token launched for three raw that claims to be worth a million cannot buy this, at any quantity.",
+      accept,
+      priceXno: toRaw("0.00001", 30).toString(),
+      // How much REAL collateral must change hands.
+      //
+      // Chosen against live numbers, and the lesson is worth stating: a
+      // collateral price has to be small next to a token's TOTAL backing, or
+      // nobody can pay it. These demo tokens are backed by fractions of a
+      // millionth of an XNO (TEACHER 1e-7, STUDENT 4e-7), so an earlier
+      // 0.000001 XNO price here was unpayable with the entire supply of either
+      // -- the offer would have looked open and accepted nothing. At 1e-9 XNO
+      // a payer needs roughly a quarter of a percent of a token's circulating
+      // supply, which is a real payment rather than an impossible one.
+      //
+      // It stays unpayable with a WORTHLESS token at any price: zero collateral
+      // spread over any supply is zero.
+      acceptAny: { priceXno: toRaw("0.000000001", 30).toString(), minBacking: "0" },
+      autoswap: true,
+      expires: 0,
+    },
+    unlock:
+      "Paid with a token nobody listed in advance.\n\n" +
+      "What made it acceptable was not its name, its picture, or the price its own AMM quotes -- " +
+      "all three are free to invent. It was the collateral behind it: earmarked XNO that consensus " +
+      "checks against the signed balance of a real wallet. That is why a token minted for three raw, " +
+      "quoting a million XNO a unit, buys exactly nothing here.",
+  },
+  {
+    input: {
+      merchant: MERCHANT,
       resource: "seller/teacher-only",
       title: "TEACHER only — no XNO accepted",
       description:

@@ -13,6 +13,7 @@ import { verifyFetchedBlock } from "../vendor/hodl/core/blockVerify.ts";
 import { foldAccounts, watchSet, opApplied, stateOf, type Fold } from "../core/fold.ts";
 import type { ChainReader, VerifiedBlock } from "../core/block.ts";
 import { verifyPayment, type Verdict } from "../core/verify.ts";
+import { backingOf, circulatingOf } from "../core/valuation.ts";
 import type { Policy } from "../core/policy.ts";
 import { rpc } from "./rpc-browser.ts";
 
@@ -67,6 +68,19 @@ export class BrowserReader implements ChainReader {
 
   async tokenOpApplied(tokenId: string, carrierHash: string) {
     return opApplied(await this.ensureFold(), tokenId, carrierHash);
+  }
+
+  /**
+   * Collateral behind a token, replayed HERE.
+   *
+   * An offer that accepts any token derives what is owed from this number, so
+   * without it the page could not re-check such a payment for itself -- it
+   * would have to take the server's word, which is the one thing this file
+   * exists to avoid.
+   */
+  async tokenBacking(tokenId: string): Promise<{ backing: bigint; circulating: bigint } | null> {
+    const st = stateOf(await this.ensureFold(), tokenId);
+    return st.launched ? { backing: backingOf(st), circulating: circulatingOf(st) } : null;
   }
 
   async tokenState() {

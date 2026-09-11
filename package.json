@@ -16,7 +16,10 @@
     "e2e": "node --experimental-strip-types scripts/e2e.ts",
     "test": "node --experimental-strip-types --test core/*.test.ts",
     "live-checkout": "node --experimental-strip-types scripts/live-checkout.ts",
-    "smoke": "node --experimental-strip-types scripts/page-smoke.ts"
+    "smoke": "node --experimental-strip-types scripts/page-smoke.ts",
+    "build:vercel": "node scripts/build-vercel.mjs",
+    "check:deploy": "node scripts/check-deploy.mjs",
+    "e2e:any": "node --experimental-strip-types scripts/e2e-anytoken.ts"
   },
   "dependencies": {
     "blakejs": "^1.2.1",

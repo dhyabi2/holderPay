@@ -34,6 +34,15 @@ export interface ChainReader {
     tokenId: string,
     carrierHash: string
   ): Promise<{ applied: boolean; reason: string; merchantBalance?: bigint }>;
+  /**
+   * Real collateral behind a token, and the supply that has claims on it.
+   *
+   * Only needed by an offer that accepts ANY token (core/policy.ts, AcceptAny),
+   * where the amount owed is derived from backing rather than read off a list.
+   * Optional for the same reason tokenOpApplied is: a verifier that cannot
+   * replay must refuse such a payment rather than guess at its value.
+   */
+  tokenBacking?(tokenId: string): Promise<{ backing: bigint; circulating: bigint } | null>;
 }
 
 export const ZERO_HASH = "0".repeat(64);

@@ -7,6 +7,7 @@
 import { getBlocks } from "./chain.ts";
 import type { ChainReader, VerifiedBlock } from "./block.ts";
 import { currentFold, stateOf, opApplied } from "./ledger.ts";
+import { backingOf, circulatingOf } from "./valuation.ts";
 
 export class NodeReader implements ChainReader {
   // Per-instance memo: one verify call touches the receipt, the payment and
@@ -38,6 +39,14 @@ export class NodeReader implements ChainReader {
   async tokenOpApplied(tokenId: string, carrierHash: string) {
     const f = await currentFold(this.extraAccounts);
     return opApplied(f, tokenId, carrierHash);
+  }
+
+  /** Collateral behind a token, from this verifier's own replay. */
+  async tokenBacking(tokenId: string): Promise<{ backing: bigint; circulating: bigint } | null> {
+    const f = await currentFold(this.extraAccounts);
+    const s = stateOf(f, tokenId);
+    if (!s.launched) return null;
+    return { backing: backingOf(s), circulating: circulatingOf(s) };
   }
 
   /** Token balance as this verifier computes it. For display, not verdicts. */

@@ -45,6 +45,42 @@ export interface AcceptedToken extends TokenSpec {
   price: string;
 }
 
+/**
+ * Take ANY token, priced by what is actually behind it.
+ *
+ * The tempting version of "accept everything" prices a token off its AMM quote,
+ * and that version is an open vault: three raw launches a token whose curve
+ * quotes a million XNO per unit with nothing behind it (measured, on mainnet --
+ * see scripts/e2e-multitoken.ts). A quote is a free assertion by whoever
+ * launched the token, so anything priced off one is free to buy.
+ *
+ * What cannot be asserted for free is COLLATERAL: the sum of the ratcheted
+ * earmark floors, each of which consensus checks against the signed balance of
+ * a real wallet. Raising a token's backing by one XNO requires somebody to
+ * actually hold one XNO. So an offer that accepts any token asks for a transfer
+ * whose pro-rata share of that collateral is worth the price, and the worthless
+ * token simply cannot produce one: zero backing spread over any supply is zero,
+ * at any amount.
+ *
+ * The honest caveat, stated in the type rather than buried: backing is a
+ * property of the token NOW, not of the payment then. If a token's collateral
+ * collapses after a payment, a verdict that was granted can stop being granted.
+ * A listed `accept[]` entry has a fixed price and never moves, which is why it
+ * remains the right way to sell for a token you have chosen deliberately.
+ */
+export interface AcceptAny {
+  /** Raw XNO of REAL COLLATERAL the transfer must be worth. */
+  priceXno: string;
+  /**
+   * Total collateral a token must have before it is accepted at all, raw XNO.
+   * Pro-rata pricing already refuses a worthless token, so this is a floor on
+   * seriousness rather than a safety check: a token backed by a thousandth of
+   * an XNO can technically pay, in a quantity that means the merchant now holds
+   * a meaningful fraction of a meaningless thing.
+   */
+  minBacking?: string;
+}
+
 export interface PolicyInput {
   /** Nano address that must be paid. */
   merchant: string;
@@ -54,6 +90,8 @@ export interface PolicyInput {
   description: string;
   /** Every token this offer accepts, each with its own price. */
   accept?: AcceptedToken[];
+  /** Also take any OTHER token, priced by its real collateral. See AcceptAny. */
+  acceptAny?: AcceptAny;
   /** Price in raw (1 XNO = 10^30 raw). Omit to refuse XNO. */
   priceXno?: string;
   /**
@@ -105,6 +143,7 @@ function hashableV1(p: PolicyInput): Record<string, unknown> {
  * offer, not two offers that look identical and are not. */
 function hashableV2(p: PolicyInput): Record<string, unknown> {
   const accept = normalizeAccept(p.accept);
+  const any = normalizeAcceptAny(p.acceptAny);
   return {
     v: 2,
     merchant: p.merchant,
@@ -121,6 +160,12 @@ function hashableV2(p: PolicyInput): Record<string, unknown> {
     autoswap: !!p.autoswap,
     swapInto: (p.swapInto ?? "").toLowerCase(),
     expires: Math.floor(p.expires) || 0,
+    // Included ONLY when set. An offer published before this existed must keep
+    // hashing to the id it already has -- its receipts are on chain and its
+    // buyers' grants are derived from that id, so adding a key unconditionally
+    // would revoke access people have paid for. Tampering is still caught: an
+    // acceptAny added or stripped in transit changes the hash either way.
+    ...(any ? { acceptAny: { priceXno: any.priceXno, minBacking: any.minBacking ?? "0" } } : {}),
   };
 }
 
@@ -157,7 +202,10 @@ export function policyId(p: PolicyInput & { v?: 1 | 2 }): string {
 
 export function makePolicy(p: PolicyInput & { v?: 1 | 2 }): Policy {
   const v = p.v ?? 2;
-  const base: PolicyInput = v === 2 ? { ...p, accept: normalizeAccept(p.accept) } : p;
+  const base: PolicyInput =
+    v === 2
+      ? { ...p, accept: normalizeAccept(p.accept), acceptAny: normalizeAcceptAny(p.acceptAny) ?? undefined }
+      : p;
   return { ...base, v, id: policyId({ ...base, v }) };
 }
 
@@ -207,7 +255,31 @@ export function acceptsXno(p: PolicyInput): boolean {
 }
 
 export function acceptsToken(p: PolicyInput & { v?: 1 | 2 }): boolean {
-  return acceptedTokens(p).length > 0;
+  return acceptedTokens(p).length > 0 || acceptAnyOf(p) !== null;
+}
+
+/** Drop an unusable acceptAny rather than half-honour it. */
+export function normalizeAcceptAny(a: AcceptAny | undefined): AcceptAny | null {
+  if (!a) return null;
+  let price: bigint;
+  let min: bigint;
+  try {
+    price = BigInt(a.priceXno ?? "0");
+    min = BigInt(a.minBacking ?? "0");
+  } catch {
+    return null;
+  }
+  if (price <= 0n || min < 0n) return null;
+  return { priceXno: price.toString(), minBacking: min.toString() };
+}
+
+/**
+ * The open-token terms of this offer, or null. v1 offers never have them: they
+ * were published before this existed and must verify exactly as they did.
+ */
+export function acceptAnyOf(p: PolicyInput & { v?: 1 | 2 }): AcceptAny | null {
+  if ((p.v ?? 2) === 1) return null;
+  return normalizeAcceptAny(p.acceptAny);
 }
 
 /** The XNO price, or null if XNO is not accepted. */

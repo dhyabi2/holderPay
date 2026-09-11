@@ -120,3 +120,67 @@ button.link { background: none; border: none; color: var(--accent); padding: 0; 
   .grid { grid-template-columns: 1fr; }
   .rows > div { grid-template-columns: 1fr; }
 }
+
+/* ── token pay buttons ──────────────────────────────────────────────────────
+   A picture, a symbol, an amount, and where you stand. The picture is drawn
+   from the token id (web/app.ts, tokenIcon) rather than fetched, so nothing
+   here can be swapped by whoever launched the token, and the page never asks
+   a third party for an image. */
+#payActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.tokenBtn {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px 10px 10px;
+  border: 1px solid var(--line, #d8dbe0);
+  border-radius: 12px;
+  background: var(--card, #fff);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  min-width: 168px;
+  transition: border-color 0.12s, transform 0.06s;
+}
+.tokenBtn:hover:not(:disabled) {
+  border-color: var(--accent, #2f6fed);
+}
+.tokenBtn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.tokenBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.tokenIcon {
+  border-radius: 8px;
+  flex: 0 0 auto;
+  shape-rendering: crispEdges; /* a hash should look like tiles, not blur */
+}
+.tokenBtnText {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+  min-width: 0;
+}
+.tokenSym {
+  font-weight: 600;
+  font-size: 0.95em;
+}
+.tokenAmt {
+  font-variant-numeric: tabular-nums;
+  font-size: 1.05em;
+}
+.tokenNote {
+  font-size: 0.78em;
+  opacity: 0.65;
+}
+/* A token the offer never listed, priced by its collateral. Marked so a payer
+   can see the difference between "the merchant chose this price" and "this is
+   what your token's backing is worth". */
+.tokenBtn.open {
+  border-style: dashed;
+}

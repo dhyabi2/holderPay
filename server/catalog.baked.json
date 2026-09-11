@@ -44,6 +44,33 @@
       },
       "unlock": "Paid in TEACHER. The seller never touched XNO, and you never had to source the token in advance.",
       "createdAt": 1789127222836
+    },
+    {
+      "policy": {
+        "merchant": "nano_177uaf8ucnokskie7nt5maanp3pqwnmmh8qowoujxi6c48htzyc1zsrcgnxf",
+        "resource": "shop/any-token",
+        "title": "Pay with any token you hold",
+        "description": "Bring whatever token you have. What it is worth here is its share of REAL collateral -- the earmarked XNO behind it, which somebody had to actually hold -- not the price its own curve quotes. A token launched for three raw that claims to be worth a million cannot buy this, at any quantity.",
+        "accept": [
+          {
+            "tokenId": "cb9b91d6f52deb3541ae3988c42cb78b",
+            "symbol": "TEACHER",
+            "decimals": 6,
+            "price": "1000000"
+          }
+        ],
+        "priceXno": "10000000000000000000000000",
+        "acceptAny": {
+          "priceXno": "1000000000000000000000",
+          "minBacking": "0"
+        },
+        "autoswap": true,
+        "expires": 0,
+        "v": 2,
+        "id": "d3d1ac006e39a0794a373ccf0f147118ae3538ddecb8614f4a6fb856bf2a6a77"
+      },
+      "unlock": "Paid with a token nobody listed in advance.\n\nWhat made it acceptable was not its name, its picture, or the price its own AMM quotes -- all three are free to invent. It was the collateral behind it: earmarked XNO that consensus checks against the signed balance of a real wallet. That is why a token minted for three raw, quoting a million XNO a unit, buys exactly nothing here.",
+      "createdAt": 1789144384171
     }
   ]
 }

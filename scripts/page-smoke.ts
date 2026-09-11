@@ -62,6 +62,9 @@ class Node {
   replaceChildren(...n: Node[]) {
     this.children = n;
   }
+  setAttribute(k: string, v: string) {
+    (this as any)[k] = v;
+  }
   querySelector() {
     return new Node("", "span");
   }
@@ -85,6 +88,10 @@ for (const id of ids) nodes.set(id, new Node(id));
     return nodes.get(id)!;
   },
   createElement: (tag: string) => new Node("", tag),
+  // The page draws each token's picture as inline SVG, built from its id
+  // (web/app.ts, tokenIcon). Without this the icon throws and every pay button
+  // silently disappears -- which is precisely how this stub earned the method.
+  createElementNS: (_ns: string, tag: string) => new Node("", tag),
   createTextNode: (t: string) => {
     const n = new Node("", "#text");
     n.textContent = t;

@@ -26,7 +26,7 @@ import {
 } from "./policy.ts";
 import { memoLink } from "./proof.ts";
 import { verifyPayment } from "./verify.ts";
-import { tokenList, sortTokens, viewToken, backingOf, quotedPriceOf } from "./valuation.ts";
+import { tokenList, sortTokens, viewToken, backingOf, circulatingOf, quotedPriceOf } from "./valuation.ts";
 import type { ChainReader, VerifiedBlock } from "./block.ts";
 
 const XNO = 10n ** 30n;
@@ -129,6 +129,10 @@ function readerFor(sim: Sim, accounts: string[]) {
   const r: ChainReader & { fold: () => Promise<any> } = {
     getBlock: async (h: string) => sim.blocks.get((h ?? "").toUpperCase()) ?? null,
     tokenOpApplied: async (tokenId: string, carrier: string) => opApplied(await ensure(), tokenId, carrier),
+    tokenBacking: async (tokenId: string) => {
+      const st = stateOf(await ensure(), tokenId);
+      return st.launched ? { backing: backingOf(st), circulating: circulatingOf(st) } : null;
+    },
     fold: ensure,
   };
   return r;
@@ -425,4 +429,165 @@ test("backing and quoted price read what they claim to read", async () => {
   assert.ok(backing <= spend, "and never exceeds what was actually committed");
   assert.ok(backing * 100n >= spend * 98n, `floor should be within the swap fee of cost, got ${backing} vs ${spend}`);
   assert.equal(quotedPriceOf(s), (s.poolXno * UNIT) / s.poolTokens);
+});
+
+// ── accepting ANY token, priced by real collateral ──────────────────────────
+//
+// The whole point of this block: "accept everything" is only safe if value is
+// measured by something that costs money. These tests buy the attack rather
+// than describe it -- a token is launched for nothing, quotes a fortune, and
+// must still be unable to pay for a thing.
+
+test("an offer that takes any token accepts one backed by real collateral", async () => {
+  const sim = new Sim();
+  sim.open(alice, XNO);
+  sim.open(merchant, 0n);
+  sim.open(buyer, XNO);
+  const tokenId = launch(sim, alice, "OPEN", 1_000_000n, 10n * XNO, 100_000n);
+  const policy = makePolicy({
+    merchant: merchant.address,
+    resource: "r",
+    title: "any token welcome",
+    description: "d",
+    // No accept[] at all: this offer has never heard of this token.
+    acceptAny: { priceXno: (XNO / 1_000_000n).toString() },
+    autoswap: false,
+    expires: 0,
+  });
+
+  // The buyer earmarks real XNO, which is what creates collateral.
+  const receipt = buyAndPay(sim, tokenId, 50n * UNIT, XNO / 100n, policy);
+  const reader = readerFor(sim, [alice.address, buyer.address, merchant.address]);
+  const v = await verifyPayment(policy, receipt.hash, reader);
+
+  assert.equal(v.granted, true, v.reason);
+  assert.equal(v.tokenId, tokenId, "the verdict names the token actually paid");
+});
+
+test("a token backed by nothing cannot pay, however much of it is sent", async () => {
+  const sim = new Sim();
+  sim.open(merchant, 0n);
+  sim.open(buyer, XNO);
+  // FOOL: launched for three blocks, quoting a million XNO of virtual reserve,
+  // with not one raw of real collateral behind it. This is the exact shape that
+  // an "accept every token at its market value" design pays out on.
+  const fool = launch(sim, buyer, "FOOL", 1_000_000n, 1_000_000n * XNO, 900_000n);
+  const policy = makePolicy({
+    merchant: merchant.address,
+    resource: "r",
+    title: "any token welcome",
+    description: "d",
+    acceptAny: { priceXno: (XNO / 1_000_000n).toString() },
+    autoswap: false,
+    expires: 0,
+  });
+
+  // Send the merchant a fortune's worth at the quoted price: the entire supply.
+  const [ta, tb] = encodeFragLinks(fool, { kind: "transfer", to: merchant.address, amount: 10_000n * UNIT });
+  sim.op(buyer, ta);
+  sim.op(buyer, tb);
+  const receipt = sim.op(buyer, memoLink(policy.id));
+
+  const reader = readerFor(sim, [buyer.address, merchant.address]);
+  const v = await verifyPayment(policy, receipt.hash, reader);
+
+  assert.equal(v.granted, false, "a token with no collateral must never buy anything");
+  assert.match(v.reason, /no collateral/);
+});
+
+test("an underpayment in an accepted-anyway token is refused", async () => {
+  const sim = new Sim();
+  sim.open(alice, XNO);
+  sim.open(merchant, 0n);
+  sim.open(buyer, XNO);
+  const tokenId = launch(sim, alice, "OPEN", 1_000_000n, 10n * XNO, 100_000n);
+  const policy = makePolicy({
+    merchant: merchant.address,
+    resource: "r",
+    title: "any token welcome",
+    description: "d",
+    // Ask for a hundred times what the buyer's whole earmark is worth.
+    acceptAny: { priceXno: (100n * XNO).toString() },
+    autoswap: false,
+    expires: 0,
+  });
+  const receipt = buyAndPay(sim, tokenId, 50n * UNIT, XNO / 100n, policy);
+  const reader = readerFor(sim, [alice.address, buyer.address, merchant.address]);
+  const v = await verifyPayment(policy, receipt.hash, reader);
+
+  assert.equal(v.granted, false);
+  assert.match(v.reason, /underpaid/);
+});
+
+test("a merchant can require a minimum backing before a token is taken at all", async () => {
+  const sim = new Sim();
+  sim.open(alice, XNO);
+  sim.open(merchant, 0n);
+  sim.open(buyer, XNO);
+  const tokenId = launch(sim, alice, "OPEN", 1_000_000n, 10n * XNO, 100_000n);
+  const policy = makePolicy({
+    merchant: merchant.address,
+    resource: "r",
+    title: "serious tokens only",
+    description: "d",
+    acceptAny: { priceXno: (XNO / 1_000_000n).toString(), minBacking: (1000n * XNO).toString() },
+    autoswap: false,
+    expires: 0,
+  });
+  const receipt = buyAndPay(sim, tokenId, 50n * UNIT, XNO / 100n, policy);
+  const reader = readerFor(sim, [alice.address, buyer.address, merchant.address]);
+  const v = await verifyPayment(policy, receipt.hash, reader);
+
+  assert.equal(v.granted, false);
+  assert.match(v.reason, /under this offer's minimum/);
+});
+
+test("a verifier that cannot value tokens refuses rather than guessing", async () => {
+  const sim = new Sim();
+  sim.open(alice, XNO);
+  sim.open(merchant, 0n);
+  sim.open(buyer, XNO);
+  const tokenId = launch(sim, alice, "OPEN", 1_000_000n, 10n * XNO, 100_000n);
+  const policy = makePolicy({
+    merchant: merchant.address,
+    resource: "r",
+    title: "any token welcome",
+    description: "d",
+    acceptAny: { priceXno: (XNO / 1_000_000n).toString() },
+    autoswap: false,
+    expires: 0,
+  });
+  const receipt = buyAndPay(sim, tokenId, 50n * UNIT, XNO / 100n, policy);
+  const full = readerFor(sim, [alice.address, buyer.address, merchant.address]);
+  // Same reader, minus the ability to value a token.
+  const blind: ChainReader = { getBlock: full.getBlock, tokenOpApplied: full.tokenOpApplied };
+  const v = await verifyPayment(policy, receipt.hash, blind);
+
+  assert.equal(v.granted, false);
+  assert.match(v.reason, /cannot value tokens/);
+});
+
+test("an offer with a listed price ignores collateral for that token", async () => {
+  const sim = new Sim();
+  sim.open(alice, XNO);
+  sim.open(merchant, 0n);
+  sim.open(buyer, XNO);
+  const tokenId = launch(sim, alice, "OPEN", 1_000_000n, 10n * XNO, 100_000n);
+  const policy = makePolicy({
+    merchant: merchant.address,
+    resource: "r",
+    title: "listed beats open",
+    description: "d",
+    // Listed at 10 tokens, while the open lane would demand a fortune.
+    accept: [{ tokenId, symbol: "OPEN", decimals: DEC, price: (10n * UNIT).toString() }],
+    acceptAny: { priceXno: (1_000_000n * XNO).toString() },
+    autoswap: false,
+    expires: 0,
+  });
+  const receipt = buyAndPay(sim, tokenId, 50n * UNIT, XNO / 100n, policy);
+  const reader = readerFor(sim, [alice.address, buyer.address, merchant.address]);
+  const v = await verifyPayment(policy, receipt.hash, reader);
+
+  assert.equal(v.granted, true, "the merchant's own listed price wins for a listed token");
+  assert.equal(v.price, (10n * UNIT).toString());
 });

@@ -193,6 +193,109 @@ function heldBalance(tokenId: string): bigint {
   }
 }
 
+/**
+ * A token's picture, drawn from its id.
+ *
+ * Deliberately NOT the token's own `image` field. That field is off-chain
+ * metadata, exactly like name and symbol, and core/valuation.ts already refuses
+ * to let those decide anything: a token that renames itself "XNO" tomorrow must
+ * not look like XNO today. An image is worse than a name, because it is a URL
+ * somebody else controls -- loading it would tell that person the IP of every
+ * visitor, let them swap the picture after a merchant approved it, and put an
+ * arbitrary remote origin inside the page's CSP.
+ *
+ * So the picture is GENERATED from the token id, which is the launch block
+ * hash. It cannot be chosen, cannot be changed, and two tokens can only look
+ * alike by colliding a hash. What the payer recognises is therefore the same
+ * thing the verifier checks.
+ */
+function tokenIcon(tokenId: string, size = 40): SVGElement {
+  const id = (tokenId || "").toLowerCase().padEnd(32, "0");
+  const byte = (i: number) => parseInt(id.slice(i * 2, i * 2 + 2) || "00", 16);
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 5 5");
+  svg.setAttribute("width", String(size));
+  svg.setAttribute("height", String(size));
+  svg.setAttribute("class", "tokenIcon");
+  svg.setAttribute("aria-hidden", "true"); // decorative: the symbol carries the meaning
+
+  const hue = (byte(0) * 360) / 256;
+  const bg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+  bg.setAttribute("width", "5");
+  bg.setAttribute("height", "5");
+  bg.setAttribute("fill", `hsl(${hue} 45% 92%)`);
+  svg.appendChild(bg);
+
+  // Mirrored 5x5: fill the left three columns from the hash, reflect the rest.
+  // Symmetry is what makes a hash look like an emblem rather than noise.
+  const fg = `hsl(${hue} 62% 42%)`;
+  for (let col = 0; col < 3; col++) {
+    for (let row = 0; row < 5; row++) {
+      if (!(byte(col * 5 + row + 1) & 1)) continue;
+      for (const c of col === 2 ? [2] : [col, 4 - col]) {
+        const cell = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+        cell.setAttribute("x", String(c));
+        cell.setAttribute("y", String(row));
+        cell.setAttribute("width", "1");
+        cell.setAttribute("height", "1");
+        cell.setAttribute("fill", fg);
+        svg.appendChild(cell);
+      }
+    }
+  }
+  return svg;
+}
+
+/** A pay button with a picture: icon, symbol, amount, and how you stand. */
+function tokenButton(opts: {
+  tokenId: string;
+  symbol: string;
+  amount: string;
+  note: string;
+  hint: string;
+  disabled: boolean;
+  open?: boolean;
+  onClick: () => void;
+}): HTMLButtonElement {
+  const btn = el("button", "tokenBtn" + (opts.open ? " open" : "")) as HTMLButtonElement;
+  btn.disabled = opts.disabled;
+  btn.title = opts.hint;
+  btn.appendChild(tokenIcon(opts.tokenId));
+  const text = el("span", "tokenBtnText");
+  text.appendChild(el("span", "tokenSym", opts.symbol));
+  text.appendChild(el("span", "tokenAmt", opts.amount));
+  text.appendChild(el("span", "tokenNote", opts.note));
+  btn.appendChild(text);
+  btn.onclick = () => {
+    document.querySelectorAll<HTMLButtonElement>("#payActions button").forEach((b) => (b.disabled = true));
+    Promise.resolve(opts.onClick()).finally(() => renderPayActions());
+  };
+  return btn;
+}
+
+/**
+ * What an unlisted token must send, when the offer takes anything.
+ *
+ * Inverts the verifier's rule (core/verify.ts): it grants when
+ * backing * amount / circulating >= price, so the payer needs
+ * ceil(price * circulating / backing). Rounded UP, because rounding down by one
+ * unit produces a payment that looks right here and is refused on chain.
+ * Returns null when the token has no collateral -- there is no amount of a
+ * worthless token that pays for anything, and offering a number would be a lie.
+ */
+function openTokenNeed(row: any, priceXno: bigint): bigint | null {
+  let backing: bigint, circulating: bigint;
+  try {
+    backing = BigInt(row.backing ?? "0");
+    circulating = BigInt(row.circulating ?? "0");
+  } catch {
+    return null;
+  }
+  if (backing <= 0n || circulating <= 0n) return null;
+  return (priceXno * circulating + backing - 1n) / backing;
+}
+
 function renderPayActions() {
   if (!current) return;
   const p = current.policy;
@@ -221,15 +324,66 @@ function renderPayActions() {
       const need = BigInt(a.price);
       const sym = a.symbol || a.tokenId.slice(0, 6);
       box.appendChild(
-        payOption(
-          `Pay ${fromRaw(need, a.decimals)} ${sym}`,
-          have >= need
-            ? `you hold ${fromRaw(have, a.decimals)} ${sym}`
-            : `you hold ${fromRaw(have, a.decimals)} ${sym} \u2014 ${fromRaw(need - have, a.decimals)} short`,
-          () => payWithToken(a),
-          have < need
-        )
+        tokenButton({
+          tokenId: a.tokenId,
+          symbol: sym,
+          amount: fromRaw(need, a.decimals),
+          note: have >= need ? `you hold ${fromRaw(have, a.decimals)}` : `${fromRaw(need - have, a.decimals)} short`,
+          hint:
+            have >= need
+              ? `the merchant lists ${sym} at ${fromRaw(need, a.decimals)}; you hold ${fromRaw(have, a.decimals)}`
+              : `you hold ${fromRaw(have, a.decimals)} ${sym} \u2014 ${fromRaw(need - have, a.decimals)} short`,
+          disabled: have < need,
+          onClick: () => payWithToken(a),
+        })
       );
+    }
+
+    // ── every OTHER token this buyer holds ─────────────────────────────────
+    // When the offer takes anything, the wallet itself is the menu. What each
+    // one owes is derived from its real collateral, so a token backed by
+    // nothing shows as unusable rather than as a bargain -- which is exactly
+    // what it is, and what the verifier will say if anyone tries it.
+    const any = (p as any).acceptAny;
+    if (any?.priceXno) {
+      const priceXno = BigInt(any.priceXno);
+      const minBacking = BigInt(any.minBacking ?? "0");
+      const listed = new Set(acceptedTokens(p).map((a) => a.tokenId));
+      const others = myTokens
+        .filter((t) => !listed.has(t.tokenId) && BigInt(t.balance || "0") > 0n)
+        .sort((x, y) => (BigInt(y.backedHoldingValue || "0") > BigInt(x.backedHoldingValue || "0") ? 1 : -1));
+
+      for (const t of others) {
+        const need = openTokenNeed(t, priceXno);
+        const have = BigInt(t.balance || "0");
+        const backing = BigInt(t.backing || "0");
+        const sym = t.symbol || t.tokenId.slice(0, 6);
+        const belowMin = backing < minBacking;
+        const usable = need !== null && !belowMin && have >= need;
+        box.appendChild(
+          tokenButton({
+            tokenId: t.tokenId,
+            symbol: sym,
+            amount: need === null ? "\u2014" : fromRaw(need, t.decimals),
+            note:
+              need === null
+                ? "nothing behind it"
+                : belowMin
+                  ? "below this offer's minimum"
+                  : have >= need
+                    ? `you hold ${fromRaw(have, t.decimals)}`
+                    : `${fromRaw(need - have, t.decimals)} short`,
+            hint:
+              need === null
+                ? `${sym} has no collateral behind it, so no amount of it can pay for anything here`
+                : `priced by real collateral: ${sym} is backed by ${fromRaw(backing, 30)} XNO across ${fromRaw(t.circulating, t.decimals)} circulating`,
+            disabled: !usable,
+            open: true,
+            onClick: () =>
+              payWithToken({ tokenId: t.tokenId, symbol: sym, decimals: t.decimals, price: need!.toString() }),
+          })
+        );
+      }
     }
   }
 
