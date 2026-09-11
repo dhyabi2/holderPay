@@ -674,8 +674,16 @@ async function main() {
   };
   $("receiveBtn").onclick = async () => {
     try {
+      // Bounded on purpose: each block received costs a proof of work off the
+      // shared key, so this takes a few at a time and says what is left rather
+      // than firing fifty nonces at one click. Dust (the 1-raw exhaust of token
+      // data blocks) is never worth a nonce and is not counted as missing.
       const r = await receiveAll(rpc, keys);
-      status(r.count ? `Received ${r.count} block(s)` : "Nothing to receive", r.count ? "ok" : "");
+      const more = r.remaining ? ` -- ${r.remaining} more, press again` : "";
+      status(
+        r.count ? `Received ${r.count} block(s)${more}` : r.remaining ? `Nothing received${more}` : "Nothing to receive",
+        r.count ? "ok" : ""
+      );
       await refreshBalances();
     } catch (e: any) {
       status(e.message, "err");

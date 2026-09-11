@@ -142,6 +142,11 @@ async function generateWork(root: string, difficulty: string, key: string): Prom
       // not us being unlucky. Say so, rather than reporting a timeout.
       last = w ? `endpoint returned a nonce that fails the ${difficulty} threshold` : "endpoint returned no nonce";
     } catch (e: any) {
+      // The endpoint ANSWERED and said no (bad key, quota spent, hash refused).
+      // Asking two more times cannot change its mind and spends two more units
+      // of the very quota that may be the problem. Only a hang or a transport
+      // failure is worth repeating.
+      if (e instanceof RpcSemanticError) throw new Error(`work_generate refused by ${NANO_RPC}: ${e.message}`);
       last = e?.message ?? String(e);
     }
   }

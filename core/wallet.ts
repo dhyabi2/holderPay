@@ -159,18 +159,86 @@ export async function waitForReceivable(
   }
 }
 
-/** Receive every receivable block so incoming XNO becomes spendable. */
-export async function receiveAll(rpc: Rpc, keys: Keys): Promise<{ count: number; balance: bigint }> {
-  const r = await rpc({ action: "receivable", account: keys.address, count: "50", source: "true", threshold: "1" });
+/**
+ * Smallest receivable worth spending a nonce on, in raw.
+ *
+ * Receiving a block costs a full proof of work, bought off the shared RPC key.
+ * So a receivable smaller than that nonce is worth is not income, it is a bill,
+ * and anyone may send you one: a stranger can spend a few raw to make your
+ * wallet spend a nonce, repeatedly, and dust-spam is the cheapest way there is
+ * to drain the key's work quota.
+ *
+ * Measured on this project's own accounts, nothing legitimate is anywhere near
+ * this line -- every real receivable observed was 10^25 raw (0.00001 XNO, the
+ * smallest price holderPay expresses), and hodlgame data blocks do NOT leave
+ * dust behind for their recipients: a fragment link carries payload, not a
+ * spendable account, so its burned raw lands in an unowned pseudo-account
+ * rather than in the merchant's wallet.
+ */
+export const DUST_RAW = 1000n;
+
+export interface ReceiveResult {
+  /** Blocks actually received. */
+  count: number;
+  balance: bigint;
+  /** Receivables below `dust`, deliberately left on the table. */
+  skipped: number;
+  /** Real receivables left over because `max` was hit -- call again to get them. */
+  remaining: number;
+}
+
+/**
+ * Receive incoming XNO so it becomes spendable.
+ *
+ * BOUNDED ON PURPOSE. Each block received needs its own proof of work, and
+ * nonces come from rpc.nano.to on the key (core/rpc.ts -- never from this
+ * machine). An unbounded receive is therefore an unbounded spend of somebody
+ * else's quota: this used to ask for up to 50 receivables and fire 50
+ * work_generate calls from a single click of the page's Receive button, which
+ * alone exceeds the proxy's whole per-minute work budget.
+ *
+ * So it takes at most `max` blocks per call and reports what is left. Nothing is
+ * lost by stopping early -- a receivable stays receivable forever, and a payment
+ * is verified from the SEND block, so an unreceived balance never changes a
+ * verdict.
+ */
+export async function receiveAll(
+  rpc: Rpc,
+  keys: Keys,
+  opts: { max?: number; dust?: bigint } = {}
+): Promise<ReceiveResult> {
+  const max = Math.max(1, Math.min(opts.max ?? 8, 25));
+  const dust = opts.dust ?? DUST_RAW;
+
+  // Ask for a few more than we will take, only so `remaining` can be honest.
+  const r = await rpc({
+    action: "receivable",
+    account: keys.address,
+    count: String(max + 10),
+    source: "true",
+    threshold: dust.toString(),
+  });
   const blocks = r?.blocks && typeof r.blocks === "object" ? r.blocks : {};
   const t = await tip(rpc, keys.address);
   let previous = t.frontier;
   let balance = t.balance;
   const representative = t.representative;
   let count = 0;
+  let skipped = 0;
+  let remaining = 0;
+
   for (const [hash, entry] of Object.entries<any>(blocks)) {
     const amount = BigInt(typeof entry === "string" ? entry : entry.amount);
-    if (amount <= 0n) continue;
+    // `threshold` is the node's word; re-check it here so the dust rule holds
+    // even if the endpoint ignores the parameter.
+    if (amount < dust) {
+      skipped++;
+      continue;
+    }
+    if (count >= max) {
+      remaining++;
+      continue;
+    }
     balance += amount;
     const w = await work(rpc, previous ?? keys.publicKey, RECEIVE_DIFFICULTY);
     const blk = buildBlock(keys.secretKey, {
@@ -184,7 +252,7 @@ export async function receiveAll(rpc: Rpc, keys: Keys): Promise<{ count: number;
     previous = String(res.hash);
     count++;
   }
-  return { count, balance };
+  return { count, balance, skipped, remaining };
 }
 
 /**

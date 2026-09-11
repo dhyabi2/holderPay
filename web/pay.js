@@ -5303,17 +5303,35 @@ async function sendXno(rpc2, keys2, to, raw) {
   if (raw <= 0n) throw new Error("amount must be positive");
   return submitLink(rpc2, keys2, uA(to), raw);
 }
-async function receiveAll(rpc2, keys2) {
-  const r2 = await rpc2({ action: "receivable", account: keys2.address, count: "50", source: "true", threshold: "1" });
+var DUST_RAW = 1000n;
+async function receiveAll(rpc2, keys2, opts = {}) {
+  const max = Math.max(1, Math.min(opts.max ?? 8, 25));
+  const dust = opts.dust ?? DUST_RAW;
+  const r2 = await rpc2({
+    action: "receivable",
+    account: keys2.address,
+    count: String(max + 10),
+    source: "true",
+    threshold: dust.toString()
+  });
   const blocks = r2?.blocks && typeof r2.blocks === "object" ? r2.blocks : {};
   const t = await tip(rpc2, keys2.address);
   let previous = t.frontier;
   let balance = t.balance;
   const representative = t.representative;
   let count = 0;
+  let skipped = 0;
+  let remaining = 0;
   for (const [hash, entry] of Object.entries(blocks)) {
     const amount = BigInt(typeof entry === "string" ? entry : entry.amount);
-    if (amount <= 0n) continue;
+    if (amount < dust) {
+      skipped++;
+      continue;
+    }
+    if (count >= max) {
+      remaining++;
+      continue;
+    }
     balance += amount;
     const w2 = await work(rpc2, previous ?? keys2.publicKey, RECEIVE_DIFFICULTY);
     const blk = buildBlock(keys2.secretKey, {
@@ -5327,7 +5345,7 @@ async function receiveAll(rpc2, keys2) {
     previous = String(res.hash);
     count++;
   }
-  return { count, balance };
+  return { count, balance, skipped, remaining };
 }
 
 // core/swap.ts
@@ -7926,7 +7944,11 @@ async function main() {
   $2("receiveBtn").onclick = async () => {
     try {
       const r2 = await receiveAll(rpc, keys);
-      status(r2.count ? `Received ${r2.count} block(s)` : "Nothing to receive", r2.count ? "ok" : "");
+      const more = r2.remaining ? ` -- ${r2.remaining} more, press again` : "";
+      status(
+        r2.count ? `Received ${r2.count} block(s)${more}` : r2.remaining ? `Nothing received${more}` : "Nothing to receive",
+        r2.count ? "ok" : ""
+      );
       await refreshBalances();
     } catch (e2) {
       status(e2.message, "err");

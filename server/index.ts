@@ -63,15 +63,101 @@ const ALLOWED_ACTIONS = new Set([
   "version",
 ]);
 
+// ── the work budget ─────────────────────────────────────────────────────────
 // `work_generate` is the expensive one and needs its own, much tighter budget.
 // It is never computed on this machine -- core/rpc.ts sends every nonce request
 // to rpc.nano.to with the key, and fails rather than falling back (see the
-// strict rule there). So what these limits protect is the KEY'S QUOTA, not our
-// CPU: without them one client could burn the whole allowance and take the
-// payment path down for everyone. A legitimate payment needs two or three
-// nonces, so a handful a minute is generous, and a global cap bounds a botnet.
+// strict rule there). So what these limits protect is the KEY'S QUOTA: without
+// them one client could burn the whole allowance and take the payment path down
+// for everyone. A legitimate payment needs two or three nonces, so a handful a
+// minute is generous, and a global cap bounds a botnet.
+//
+// Over budget, a caller WAITS for the next window rather than being turned
+// away. A 429 in the middle of a checkout is indistinguishable from a broken
+// payment to the person making it -- they have already signed nothing, know
+// nothing about minute windows, and will simply click again, which costs
+// another slot and makes the queue worse. Holding the request costs the server
+// a timer and gets the payment through on the same connection.
+//
+// Waiting is bounded in both directions so it cannot become its own outage: no
+// single request is held longer than WORK_MAX_WAIT_MS, and no more than
+// WORK_MAX_WAITERS may be parked at once. Past either bound the answer is an
+// honest 429 that says how long to wait, rather than a request held forever.
 const WORK_PER_IP_PER_MIN = 12;
 const WORK_GLOBAL_PER_MIN = 120;
+const WORK_MAX_WAIT_MS = 75_000;
+const WORK_MAX_WAITERS = 64;
+
+interface Budget {
+  n: number;
+  /** When this fixed window rolls over and the count resets. */
+  until: number;
+}
+const workBudgets = new Map<string, Budget>();
+let workWaiters = 0;
+
+function budgetFor(key: string): Budget {
+  const now = Date.now();
+  let b = workBudgets.get(key);
+  if (!b || now > b.until) {
+    b = { n: 0, until: now + 60_000 };
+    workBudgets.set(key, b);
+    // The per-IP map would otherwise grow without limit under a botnet.
+    if (workBudgets.size > 5000) {
+      for (const [k, v] of workBudgets) if (now > v.until) workBudgets.delete(k);
+    }
+  }
+  return b;
+}
+
+/** ms until `key` has a slot free; 0 if one is free right now. */
+function msUntilSlot(key: string, max: number): number {
+  const b = budgetFor(key);
+  return b.n < max ? 0 : Math.max(0, b.until - Date.now());
+}
+
+type WorkSlot = { ok: true; waitedMs: number } | { ok: false; retryAfterMs: number; reason: string };
+
+/**
+ * Get a work slot, waiting for the next window if the current one is spent.
+ * Consumes the slot only when it actually returns ok.
+ */
+async function awaitWorkSlot(ip: string, res: http.ServerResponse): Promise<WorkSlot> {
+  const started = Date.now();
+  for (;;) {
+    const wait = Math.max(
+      msUntilSlot(`ip:${ip}`, WORK_PER_IP_PER_MIN),
+      msUntilSlot("global", WORK_GLOBAL_PER_MIN)
+    );
+    if (wait <= 0) {
+      budgetFor(`ip:${ip}`).n++;
+      budgetFor("global").n++;
+      return { ok: true, waitedMs: Date.now() - started };
+    }
+    if (Date.now() - started + wait > WORK_MAX_WAIT_MS) {
+      return { ok: false, retryAfterMs: wait, reason: "the work budget is spent for longer than a request may be held" };
+    }
+    if (workWaiters >= WORK_MAX_WAITERS) {
+      return { ok: false, retryAfterMs: wait, reason: "too many requests already waiting for work" };
+    }
+    workWaiters++;
+    try {
+      // Wake a little after the window turns, and in any case often enough to
+      // notice a client that has gone away.
+      await new Promise((r) => setTimeout(r, Math.min(wait + 50, 5_000)));
+    } finally {
+      workWaiters--;
+    }
+    // Nobody is listening any more -- stop holding a slot for them.
+    //
+    // Check the RESPONSE, not the request. readBody() has already consumed the
+    // request stream by this point, so `req.readable` is false for every normal
+    // caller: testing it here silently dropped every waiting request without
+    // answering, and the connection hung until the client gave up. `res` stays
+    // writable exactly as long as someone is still there to write to.
+    if (res.destroyed || res.writableEnded) return { ok: false, retryAfterMs: 0, reason: "client went away" };
+  }
+}
 
 // Crude per-key limiter: enough to stop a stray loop, or a cheap DoS, from
 // burning the RPC quota. In-memory, so it resets on restart and does
@@ -232,10 +318,21 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const action = String(body?.action ?? "");
       if (!ALLOWED_ACTIONS.has(action)) return json(res, 400, { error: `action not allowed: ${action}` });
+      let workWaitMs = 0;
       if (action === "work_generate") {
-        if (!rateLimit(`work:${ip}`, WORK_PER_IP_PER_MIN, 60_000) || !rateLimit("work:global", WORK_GLOBAL_PER_MIN, 60_000)) {
-          return json(res, 429, { error: "too many proof-of-work requests -- try again in a minute" });
+        const slot = await awaitWorkSlot(ip, res);
+        if (!slot.ok) {
+          if (slot.retryAfterMs === 0) return; // client hung up mid-wait
+          const secs = Math.ceil(slot.retryAfterMs / 1000);
+          res.setHeader("retry-after", String(secs));
+          return json(res, 429, {
+            error: `proof of work is rate limited -- ${slot.reason}. Try again in ${secs}s.`,
+            retryAfterMs: slot.retryAfterMs,
+          });
         }
+        workWaitMs = slot.waitedMs;
+        // Observable without changing the RPC response shape.
+        if (workWaitMs > 0) res.setHeader("x-work-wait-ms", String(workWaitMs));
       }
       try {
         return json(res, 200, await rpc(body));
