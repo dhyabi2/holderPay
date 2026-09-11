@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>holderPay — pay with TEACHER or XNO on Nano</title>
+<link rel="stylesheet" href="/pay.css" />
+</head>
+<body>
+<header class="bar">
+  <div class="brand">holder<span>Pay</span></div>
+  <div class="bar-right">
+    <span class="chip" id="tokenChip">token —</span>
+    <span class="chip" id="wsChip"><i class="dot"></i> socket</span>
+  </div>
+</header>
+
+<main>
+  <!-- ── the offer ───────────────────────────────────────────────────────── -->
+  <section class="card" id="offerCard">
+    <div class="card-head">
+      <h1 id="offerTitle">Loading offer…</h1>
+      <button class="link" id="switchOffer" hidden>change offer</button>
+    </div>
+    <p class="muted" id="offerDesc"></p>
+
+    <dl class="kv">
+      <div><dt>merchant</dt><dd class="mono" id="offerMerchant">—</dd></div>
+      <div><dt>price</dt><dd id="offerPrice">—</dd></div>
+      <div><dt>policy id</dt><dd class="mono small" id="offerPolicy">—</dd></div>
+      <div><dt>receipt link</dt><dd class="mono small" id="offerMemo">—</dd></div>
+    </dl>
+
+    <details class="note">
+      <summary>What the policy id is for</summary>
+      <p>
+        The policy id is the hash of this entire offer — merchant, price, resource,
+        expiry. Your payment commits to it on chain, in a block only your key can
+        sign. Nobody can afterwards claim the price was different, and nobody can
+        claim you paid when you did not: there is no "grant" switch on the server
+        to flip, only blocks anyone can re-check.
+      </p>
+    </details>
+  </section>
+
+  <!-- ── wallet ──────────────────────────────────────────────────────────── -->
+  <section class="card">
+    <div class="card-head"><h2>Your wallet</h2><button class="link" id="walletMenu">seed</button></div>
+    <p class="muted small">
+      A burner wallet, created in this browser. The key never leaves this page —
+      holderPay's server has no key, signs nothing, and cannot move your funds.
+    </p>
+    <div class="addr">
+      <code class="mono" id="walletAddr">—</code>
+      <button class="ghost" id="copyAddr">copy</button>
+    </div>
+    <div class="balances">
+      <div><span class="muted small">XNO</span><b id="balXno">0</b></div>
+      <div><span class="muted small" id="balTokLabel">TEACHER</span><b id="balTok">0</b></div>
+      <div><button class="ghost" id="receiveBtn">receive pending</button></div>
+    </div>
+  </section>
+
+  <!-- ── pay ─────────────────────────────────────────────────────────────── -->
+  <section class="card">
+    <div class="card-head"><h2>Pay</h2></div>
+    <div class="pay-actions" id="payActions"></div>
+    <div class="log" id="log"></div>
+  </section>
+
+  <!-- ── verdict ─────────────────────────────────────────────────────────── -->
+  <section class="card" id="verdictCard" hidden>
+    <div class="card-head"><h2>Proof</h2><button class="link" id="recheck">re-check</button></div>
+    <div class="verdict" id="verdict"></div>
+    <div class="crosscheck" id="crosscheck"></div>
+    <div class="unlock" id="unlock" hidden></div>
+    <div class="tamper">
+      <button class="ghost danger" id="tamperBtn">run the tamper test</button>
+      <span class="muted small">ask the server to lie, and watch this page catch it</span>
+    </div>
+  </section>
+
+  <!-- ── merchant config ─────────────────────────────────────────────────── -->
+  <section class="card">
+    <div class="card-head"><h2>Merchant: configure what you accept</h2>
+      <button class="link" id="toggleCfg">show</button></div>
+    <div id="cfgPanel" hidden>
+      <p class="muted small">
+        Choose the token, set the prices, publish the offer. The offer's id is
+        the hash of these fields, so changing any of them later is a different
+        offer — not a re-priced one.
+      </p>
+      <div class="grid">
+        <label>Title<input id="cfgTitle" value="Nano 101 — full course" /></label>
+        <label>Resource id<input id="cfgResource" value="course/nano-101" /></label>
+        <label class="wide">Description<input id="cfgDesc" value="Everything in the course, forever." /></label>
+        <label class="wide">Merchant address<input id="cfgMerchant" class="mono" /></label>
+        <label>Token id (32 hex)<input id="cfgTokenId" class="mono" /></label>
+        <label>Token symbol<input id="cfgSymbol" value="TEACHER" /></label>
+        <label>Price in token<input id="cfgPriceToken" value="1" /></label>
+        <label>Price in XNO (blank = refuse XNO)<input id="cfgPriceXno" value="0.00001" /></label>
+        <label class="check"><input type="checkbox" id="cfgAutoswap" checked /> accept XNO but settle in the token (auto-swap)</label>
+        <label class="wide">What the buyer unlocks<textarea id="cfgUnlock" rows="3">Welcome to Nano 101. Your access is proven by a Nano block, not by our database.</textarea></label>
+      </div>
+      <button class="primary" id="cfgSave">publish offer</button>
+    </div>
+  </section>
+
+  <footer class="muted small">
+    <p>
+      Settles on <b>Nano (XNO)</b>. Token ledger, AMM and op encoding are
+      <a href="https://github.com/dhyabi2/hodlgame">hodlgame</a>'s (Apache-2.0),
+      replayed here independently. All chain access goes to
+      <b>rpc.nano.to</b> and its websocket <b>ws.nano.to</b> — no other service.
+    </p>
+  </footer>
+</main>
+
+<script type="module" src="/pay.js"></script>
+</body>
+</html>

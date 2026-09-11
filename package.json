@@ -1,0 +1,24 @@
+{
+  "name": "holderpay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pay with a Nano token (TEACHER) or XNO, and get access nobody can grant without the payment.",
+  "type": "module",
+  "scripts": {
+    "dev": "node --experimental-strip-types server/index.ts",
+    "build:web": "node scripts/build-web.mjs",
+    "keys": "node --experimental-strip-types scripts/keys.ts",
+    "launch": "node --experimental-strip-types scripts/launch-token.ts",
+    "e2e": "node --experimental-strip-types scripts/e2e.ts",
+    "test": "node --experimental-strip-types --test core/*.test.ts"
+  },
+  "dependencies": {
+    "blakejs": "^1.2.1",
+    "buffer": "^6.0.3",
+    "nanocurrency": "^2.5.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
