@@ -15,7 +15,8 @@
     "await-funding": "node --experimental-strip-types scripts/await-funding.ts",
     "e2e": "node --experimental-strip-types scripts/e2e.ts",
     "test": "node --experimental-strip-types --test core/*.test.ts",
-    "live-checkout": "node --experimental-strip-types scripts/live-checkout.ts"
+    "live-checkout": "node --experimental-strip-types scripts/live-checkout.ts",
+    "smoke": "node --experimental-strip-types scripts/page-smoke.ts"
   },
   "dependencies": {
     "blakejs": "^1.2.1",

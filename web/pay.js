@@ -7341,6 +7341,12 @@ function log(msg, kind = "") {
   $2("log").appendChild(line);
   $2("log").scrollTop = $2("log").scrollHeight;
 }
+function status(msg, kind = "") {
+  const n2 = $2("status");
+  n2.className = "status " + kind;
+  n2.textContent = msg;
+  if (msg) log(msg, kind);
+}
 var cfg;
 var listings = [];
 var current = null;
@@ -7383,37 +7389,34 @@ function recallReceipt(policyId2) {
 }
 function renderOffer() {
   if (!current) {
-    $2("offerTitle").textContent = "No offer published yet";
-    $2("offerDesc").textContent = "Use the merchant panel below to publish one.";
+    $2("offerTitle").textContent = "Nothing for sale yet";
+    $2("offerDesc").textContent = "";
+    $2("offerPrice").textContent = "";
     $2("payActions").replaceChildren();
     return;
   }
   const p = current.policy;
   $2("offerTitle").textContent = p.title || p.resource;
   $2("offerDesc").textContent = p.description;
-  $2("offerMerchant").textContent = p.merchant;
-  $2("offerPolicy").textContent = p.id;
-  $2("offerMemo").textContent = current.receiptLink;
   $2("switchOffer").hidden = listings.length < 2;
-  const bits = [];
-  if (p.priceToken && p.token) bits.push(`${fromRaw(p.priceToken, p.token.decimals)} ${p.token.symbol}`);
-  if (p.priceXno) bits.push(`${fromRaw(p.priceXno, 30)} XNO`);
-  $2("offerPrice").textContent = bits.join("  or  ") || "\u2014";
+  const box = $2("offerPrice");
+  box.replaceChildren();
+  const token = p.priceToken && p.token ? `${fromRaw(p.priceToken, p.token.decimals)} ${p.token.symbol}` : "";
+  const xno = p.priceXno ? `${fromRaw(p.priceXno, 30)} XNO` : "";
+  const [headline, alt] = token ? [token, xno] : [xno, ""];
+  box.appendChild(el("span", "", headline || "\u2014"));
+  if (alt) box.appendChild(el("span", "alt", `or ${alt}`));
   renderPayActions();
 }
-function payOption(title, sub, label, onClick, disabled = false) {
-  const row = el("div", "pay-option");
-  const what = el("div", "what");
-  what.appendChild(el("b", "", title));
-  what.appendChild(el("span", "muted small", sub));
+function payOption(label, hint, onClick, disabled = false) {
   const btn = el("button", "primary", label);
   btn.disabled = disabled;
+  btn.title = hint;
   btn.onclick = () => {
-    document.querySelectorAll(".pay-option button").forEach((b) => b.disabled = true);
+    document.querySelectorAll("#payActions button").forEach((b) => b.disabled = true);
     Promise.resolve(onClick()).finally(() => renderPayActions());
   };
-  row.append(what, btn);
-  return row;
+  return btn;
 }
 function renderPayActions() {
   if (!current) return;
@@ -7428,8 +7431,7 @@ function renderPayActions() {
     box.appendChild(
       payOption(
         `Pay ${fromRaw(need, dec)} ${p.token.symbol}`,
-        have >= need ? `you hold ${fromRaw(have, dec)} ${p.token.symbol}` : `you hold ${fromRaw(have, dec)} \u2014 not enough on its own`,
-        "pay",
+        `you hold ${fromRaw(have, dec)} ${p.token.symbol}`,
         () => payWithToken(),
         have < need
       )
@@ -7437,21 +7439,15 @@ function renderPayActions() {
   }
   if (lanes.includes("XNO")) {
     box.appendChild(
-      payOption(
-        `Pay ${fromRaw(p.priceXno, 30)} XNO`,
-        "straight to the merchant, wallet to wallet",
-        "pay",
-        () => payWithXno()
-      )
+      payOption(`Pay ${fromRaw(p.priceXno, 30)} XNO`, "straight to the merchant, wallet to wallet", () => payWithXno())
     );
   }
   if (p.autoswap && p.token && p.priceToken) {
     const canQuote = tokenView && BigInt(tokenView.poolXno ?? "0") > 0n;
     box.appendChild(
       payOption(
-        `Pay with XNO, settle in ${p.token.symbol}`,
-        canQuote ? "buys the token on the AMM in your wallet, then pays the merchant in it" : "no liquidity on the curve yet",
-        "swap & pay",
+        `Pay with XNO \u2192 ${p.token.symbol}`,
+        "buys the token on the AMM in your own wallet, then pays the merchant in it",
         () => payWithSwap(),
         !canQuote
       )
@@ -7459,55 +7455,50 @@ function renderPayActions() {
   }
 }
 function renderVerdict(mine, check) {
-  $2("verdictCard").hidden = false;
+  const card = $2("verdictCard");
+  card.hidden = false;
   const v2 = check?.mine ?? mine;
-  const box = $2("verdict");
-  box.replaceChildren();
   if (!v2) return;
-  box.className = "verdict " + (v2.granted ? "granted" : "denied");
-  box.appendChild(el("h3", "", v2.granted ? "Access is owed" : "Not yet"));
-  box.appendChild(el("div", "reason", v2.reason));
-  const rows = el("div", "rows");
+  const badge = $2("verdictBadge");
+  badge.className = v2.granted ? "granted" : "denied";
+  badge.textContent = v2.granted ? "Paid \u2713 verified on chain" : v2.reason;
+  const rows = $2("verdictRows");
+  rows.replaceChildren();
   const row = (k2, val) => {
     const d2 = el("div");
-    d2.append(el("span", "", k2), el("span", "mono", val));
+    d2.append(el("span", "", k2), el("span", "", val));
     rows.appendChild(d2);
   };
-  if (v2.asset) row("asset", v2.asset);
   if (v2.paid && v2.price) {
     const dec = v2.asset === "XNO" ? 30 : current?.policy.token?.decimals ?? 6;
-    row("paid", `${fromRaw(v2.paid, dec)} (price ${fromRaw(v2.price, dec)})`);
+    row("paid", `${fromRaw(v2.paid, dec)} / ${fromRaw(v2.price, dec)} ${v2.asset === "XNO" ? "XNO" : current?.policy.token?.symbol ?? ""}`);
   }
   if (v2.payer) row("payer", v2.payer);
   if (v2.payment) row("payment", v2.payment);
   if (v2.receipt) row("receipt", v2.receipt);
-  if (v2.grant) row("grant id", v2.grant);
-  row("confirmed", String(v2.confirmed));
-  box.appendChild(rows);
+  if (v2.grant) row("grant", v2.grant);
+  if (current) row("policy", current.policy.id);
   const cc = $2("crosscheck");
   cc.replaceChildren();
   if (!check) {
-    cc.className = "crosscheck";
+    cc.className = "crosscheck muted";
     cc.textContent = "checking independently\u2026";
     return;
   }
   if (check.serverOverclaimed) {
+    card.open = true;
     cc.className = "crosscheck disagree";
-    cc.appendChild(
-      el(
-        "b",
-        "",
-        "The server claimed this grant. This browser re-checked the ledger and it does not hold."
-      )
-    );
+    cc.appendChild(el("b", "", "Refused: the server claimed this grant, the ledger does not support it."));
     const ul = el("ul");
     for (const d2 of check.differences) ul.appendChild(el("li", "", d2));
     cc.appendChild(ul);
-    cc.appendChild(el("div", "small", "Access refused locally. This is the failure mode holderPay is built to make visible."));
+    badge.className = "denied";
+    badge.textContent = "Refused \u2014 the server and the chain disagree";
   } else if (check.agrees) {
     cc.className = "crosscheck agree";
-    cc.textContent = "Verified independently in this browser: the server's answer matches the ledger.";
+    cc.textContent = "Re-verified in this browser: the server matches the ledger.";
   } else {
+    card.open = true;
     cc.className = "crosscheck disagree";
     cc.appendChild(el("b", "", "This browser and the server disagree."));
     const ul = el("ul");
@@ -7539,7 +7530,7 @@ async function payWithXno() {
   const p = current.policy;
   const amount = BigInt(p.priceXno);
   try {
-    log(`paying ${fromRaw(amount, 30)} XNO to ${short(p.merchant)}\u2026`);
+    status(`Paying ${fromRaw(amount, 30)} XNO\u2026`);
     await ensureHellos();
     const payment = await sendXno(rpc, keys, p.merchant, amount);
     log(`payment block ${short(payment)}`, "ok");
@@ -7547,14 +7538,14 @@ async function payWithXno() {
     log(`receipt block ${short(receipt)} \u2014 committed to policy ${short(p.id, 8)}`, "ok");
     await onPaid(receipt);
   } catch (e2) {
-    log(`payment failed: ${e2.message}`, "err");
+    status(e2.message, "err");
   }
 }
 async function payWithToken() {
   if (!current?.policy.token) return;
   const p = current.policy;
   try {
-    log(`transferring ${fromRaw(p.priceToken, p.token.decimals)} ${p.token.symbol}\u2026`);
+    status(`Paying ${fromRaw(p.priceToken, p.token.decimals)} ${p.token.symbol}\u2026`);
     await ensureHellos();
     const r2 = await payTokenWithReceipt(
       rpc,
@@ -7568,7 +7559,7 @@ async function payWithToken() {
     log(`receipt block ${short(r2.receipt)}`, "ok");
     await onPaid(r2.receipt);
   } catch (e2) {
-    log(`token payment failed: ${e2.message}`, "err");
+    status(e2.message, "err");
   }
 }
 async function payWithSwap() {
@@ -7580,7 +7571,7 @@ async function payWithSwap() {
     const have = BigInt(tokenView?.you?.balance ?? "0");
     if (have < want) {
       const missing = want - have;
-      log(`buying ${fromRaw(missing, p.token.decimals)} ${p.token.symbol} on the AMM\u2026`);
+      status(`Swapping XNO for ${fromRaw(missing, p.token.decimals)} ${p.token.symbol}\u2026`);
       const st = await loadTokenState(true);
       const walletBalance = (await tip(rpc, keys.address)).balance;
       const plan = planSwap({
@@ -7598,12 +7589,12 @@ async function payWithSwap() {
       log(`swap block ${short(h)}`, "ok");
       await loadTokenState(true);
     }
-    log(`paying the merchant in ${p.token.symbol}\u2026`);
+    status(`Paying in ${p.token.symbol}\u2026`);
     const r2 = await payTokenWithReceipt(rpc, keys, p.token.tokenId, p.merchant, want, memoLink(p.id));
     log(`receipt block ${short(r2.receipt)}`, "ok");
     await onPaid(r2.receipt);
   } catch (e2) {
-    log(`swap payment failed: ${e2.message}`, "err");
+    status(e2.message, "err");
   }
 }
 async function onPaid(receipt) {
@@ -7631,7 +7622,7 @@ async function checkReceipt(receipt, forge = false) {
   renderVerdict(null, null);
   const theirs = await askServer(receipt, forge);
   renderVerdict(theirs, null);
-  log("re-verifying independently in this browser (replaying the ledger)\u2026");
+  status("Verifying against the chain\u2026");
   const reader = new BrowserReader(current.policy.token?.tokenId ?? "", [
     keys.address,
     current.policy.merchant,
@@ -7639,8 +7630,8 @@ async function checkReceipt(receipt, forge = false) {
   ]);
   const check = await verifyLocally(current.policy, receipt, reader, theirs);
   renderVerdict(check.mine, check);
-  if (check.serverOverclaimed) log("the server claimed a grant the ledger does not support \u2014 refused", "err");
-  else if (check.agrees) log(check.mine.granted ? "verified: access is owed" : `not granted: ${check.mine.reason}`, check.mine.granted ? "ok" : "");
+  if (check.serverOverclaimed) status("Refused \u2014 the server and the chain disagree", "err");
+  else if (check.agrees) status(check.mine.granted ? "" : check.mine.reason, check.mine.granted ? "ok" : "");
   if (check.mine.granted && !forge) await claimAccess(receipt);
 }
 async function claimAccess(receipt) {
@@ -7655,15 +7646,14 @@ async function claimAccess(receipt) {
     });
     const j2 = await res.json();
     if (j2.unlock) {
-      const box = $2("unlock");
-      box.hidden = false;
-      box.textContent = j2.unlock;
-      log("access granted", "ok");
+      $2("unlockCard").hidden = false;
+      $2("unlock").textContent = j2.unlock;
+      status("", "ok");
     } else {
-      log(`access refused: ${j2.error}`, "err");
+      status(j2.error, "err");
     }
   } catch (e2) {
-    log(`could not claim access: ${e2.message}`, "err");
+    status(e2.message, "err");
   }
 }
 async function loadTokenState(force = false) {
@@ -7759,11 +7749,6 @@ function connectSocket() {
   }, 25e3);
 }
 function wireConfigPanel() {
-  $2("toggleCfg").onclick = () => {
-    const p = $2("cfgPanel");
-    p.hidden = !p.hidden;
-    $2("toggleCfg").textContent = p.hidden ? "show" : "hide";
-  };
   $2("cfgMerchant").value = cfg.merchant;
   $2("cfgTokenId").value = cfg.tokenId;
   $2("cfgSave").onclick = async () => {
@@ -7792,8 +7777,8 @@ function wireConfigPanel() {
       body: JSON.stringify(body)
     });
     const j2 = await res.json();
-    if (j2.error) return log(`could not publish: ${j2.error}`, "err");
-    log(`published offer ${short(j2.policy.id, 8)}`, "ok");
+    if (j2.error) return status(j2.error, "err");
+    status("Published", "ok");
     await loadListings();
     await refreshBalances();
   };
@@ -7810,16 +7795,16 @@ async function main() {
   $2("receiveBtn").onclick = async () => {
     try {
       const r2 = await receiveAll(rpc, keys);
-      log(r2.count ? `received ${r2.count} block(s)` : "nothing to receive", r2.count ? "ok" : "");
+      status(r2.count ? `Received ${r2.count} block(s)` : "Nothing to receive", r2.count ? "ok" : "");
       await refreshBalances();
     } catch (e2) {
-      log(`receive failed: ${e2.message}`, "err");
+      status(e2.message, "err");
     }
   };
   $2("recheck").onclick = () => checkReceipt(lastReceipt);
   $2("tamperBtn").onclick = async () => {
-    if (!lastReceipt) return log("pay first \u2014 there is nothing to tamper with yet", "err");
-    log("asking the server to forge a grant\u2026");
+    if (!lastReceipt) return status("Pay first \u2014 there is nothing to tamper with yet", "err");
+    status("Asking the server to forge a grant\u2026");
     await checkReceipt(lastReceipt, true);
   };
   $2("switchOffer").onclick = () => {
@@ -7828,10 +7813,17 @@ async function main() {
     renderOffer();
     void refreshBalances();
   };
-  wireConfigPanel();
-  await loadListings();
-  await refreshBalances();
-  connectSocket();
+  const step = async (name, fn) => {
+    try {
+      await fn();
+    } catch (e2) {
+      log(`${name} failed: ${e2?.message ?? e2}`, "err");
+    }
+  };
+  await step("merchant panel", () => wireConfigPanel());
+  await step("offers", () => loadListings());
+  await step("websocket", () => connectSocket());
+  await step("balances", () => refreshBalances());
   log(`wallet ${keys.address}`);
   log("chain access: rpc.nano.to only (proxied so the key stays server-side)");
 }

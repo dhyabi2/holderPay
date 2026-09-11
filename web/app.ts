@@ -18,7 +18,7 @@ import { lanesOf } from "../core/verify.ts";
 import type { Policy } from "../core/policy.ts";
 import type { Verdict } from "../core/verify.ts";
 import { keysFromSeed, toRaw, fromRaw, receiveAll, sendXno, submitLink, tip, type Keys } from "../core/wallet.ts";
-import { planSwap, executeSwap, payTokenWithReceipt, quoteBuy, type SwapPlan } from "../core/swap.ts";
+import { planSwap, executeSwap, payTokenWithReceipt, type SwapPlan } from "../core/swap.ts";
 import { ANCHOR_PUB } from "../vendor/hodl/core/anchor.ts";
 import { rpc } from "./rpc-browser.ts";
 import { BrowserReader, verifyLocally, type CrossCheck } from "./verifier.ts";
@@ -37,6 +37,15 @@ function log(msg: string, kind: "" | "ok" | "err" = "") {
   const line = el("div", kind, `${new Date().toLocaleTimeString()}  ${msg}`);
   $("log").appendChild(line);
   $("log").scrollTop = $("log").scrollHeight;
+}
+
+/** The one line a payer reads while something is happening. Everything else
+ * that used to be on screen now lives in the log or a disclosure. */
+function status(msg: string, kind: "" | "ok" | "err" = "") {
+  const n = $("status");
+  n.className = "status " + kind;
+  n.textContent = msg;
+  if (msg) log(msg, kind);
 }
 
 // ── state ───────────────────────────────────────────────────────────────────
@@ -104,40 +113,38 @@ function recallReceipt(policyId: string): string {
 
 function renderOffer() {
   if (!current) {
-    $("offerTitle").textContent = "No offer published yet";
-    $("offerDesc").textContent = "Use the merchant panel below to publish one.";
+    $("offerTitle").textContent = "Nothing for sale yet";
+    $("offerDesc").textContent = "";
+    $("offerPrice").textContent = "";
     $("payActions").replaceChildren();
     return;
   }
   const p = current.policy;
   $("offerTitle").textContent = p.title || p.resource;
   $("offerDesc").textContent = p.description;
-  $("offerMerchant").textContent = p.merchant;
-  $("offerPolicy").textContent = p.id;
-  $("offerMemo").textContent = current.receiptLink;
   $("switchOffer").hidden = listings.length < 2;
 
-  const bits: string[] = [];
-  if (p.priceToken && p.token) bits.push(`${fromRaw(p.priceToken, p.token.decimals)} ${p.token.symbol}`);
-  if (p.priceXno) bits.push(`${fromRaw(p.priceXno, 30)} XNO`);
-  $("offerPrice").textContent = bits.join("  or  ") || "—";
+  // One headline price, with the alternative asset as a quiet aside.
+  const box = $("offerPrice");
+  box.replaceChildren();
+  const token = p.priceToken && p.token ? `${fromRaw(p.priceToken, p.token.decimals)} ${p.token.symbol}` : "";
+  const xno = p.priceXno ? `${fromRaw(p.priceXno, 30)} XNO` : "";
+  const [headline, alt] = token ? [token, xno] : [xno, ""];
+  box.appendChild(el("span", "", headline || "—"));
+  if (alt) box.appendChild(el("span", "alt", `or ${alt}`));
 
   renderPayActions();
 }
 
-function payOption(title: string, sub: string, label: string, onClick: () => void, disabled = false) {
-  const row = el("div", "pay-option");
-  const what = el("div", "what");
-  what.appendChild(el("b", "", title));
-  what.appendChild(el("span", "muted small", sub));
+function payOption(label: string, hint: string, onClick: () => void, disabled = false) {
   const btn = el("button", "primary", label) as HTMLButtonElement;
   btn.disabled = disabled;
+  btn.title = hint; // the explanation is a tooltip now, not a paragraph
   btn.onclick = () => {
-    document.querySelectorAll<HTMLButtonElement>(".pay-option button").forEach((b) => (b.disabled = true));
+    document.querySelectorAll<HTMLButtonElement>("#payActions button").forEach((b) => (b.disabled = true));
     Promise.resolve(onClick()).finally(() => renderPayActions());
   };
-  row.append(what, btn);
-  return row;
+  return btn;
 }
 
 function renderPayActions() {
@@ -154,10 +161,7 @@ function renderPayActions() {
     box.appendChild(
       payOption(
         `Pay ${fromRaw(need, dec)} ${p.token.symbol}`,
-        have >= need
-          ? `you hold ${fromRaw(have, dec)} ${p.token.symbol}`
-          : `you hold ${fromRaw(have, dec)} — not enough on its own`,
-        "pay",
+        `you hold ${fromRaw(have, dec)} ${p.token.symbol}`,
         () => payWithToken(),
         have < need
       )
@@ -166,12 +170,7 @@ function renderPayActions() {
 
   if (lanes.includes("XNO")) {
     box.appendChild(
-      payOption(
-        `Pay ${fromRaw(p.priceXno!, 30)} XNO`,
-        "straight to the merchant, wallet to wallet",
-        "pay",
-        () => payWithXno()
-      )
+      payOption(`Pay ${fromRaw(p.priceXno!, 30)} XNO`, "straight to the merchant, wallet to wallet", () => payWithXno())
     );
   }
 
@@ -180,11 +179,8 @@ function renderPayActions() {
     const canQuote = tokenView && BigInt(tokenView.poolXno ?? "0") > 0n;
     box.appendChild(
       payOption(
-        `Pay with XNO, settle in ${p.token.symbol}`,
-        canQuote
-          ? "buys the token on the AMM in your wallet, then pays the merchant in it"
-          : "no liquidity on the curve yet",
-        "swap & pay",
+        `Pay with XNO \u2192 ${p.token.symbol}`,
+        "buys the token on the AMM in your own wallet, then pays the merchant in it",
         () => payWithSwap(),
         !canQuote
       )
@@ -193,58 +189,56 @@ function renderPayActions() {
 }
 
 function renderVerdict(mine: Verdict | null, check: CrossCheck | null) {
-  $("verdictCard").hidden = false;
+  const card = $("verdictCard") as HTMLDetailsElement;
+  card.hidden = false;
   const v = check?.mine ?? mine;
-  const box = $("verdict");
-  box.replaceChildren();
   if (!v) return;
 
-  box.className = "verdict " + (v.granted ? "granted" : "denied");
-  box.appendChild(el("h3", "", v.granted ? "Access is owed" : "Not yet"));
-  box.appendChild(el("div", "reason", v.reason));
+  // The summary is the whole story for a payer: granted, or why not.
+  const badge = $("verdictBadge");
+  badge.className = v.granted ? "granted" : "denied";
+  badge.textContent = v.granted ? "Paid \u2713 verified on chain" : v.reason;
 
-  const rows = el("div", "rows");
+  const rows = $("verdictRows");
+  rows.replaceChildren();
   const row = (k: string, val: string) => {
     const d = el("div");
-    d.append(el("span", "", k), el("span", "mono", val));
+    d.append(el("span", "", k), el("span", "", val));
     rows.appendChild(d);
   };
-  if (v.asset) row("asset", v.asset);
   if (v.paid && v.price) {
     const dec = v.asset === "XNO" ? 30 : current?.policy.token?.decimals ?? 6;
-    row("paid", `${fromRaw(v.paid, dec)} (price ${fromRaw(v.price, dec)})`);
+    row("paid", `${fromRaw(v.paid, dec)} / ${fromRaw(v.price, dec)} ${v.asset === "XNO" ? "XNO" : current?.policy.token?.symbol ?? ""}`);
   }
   if (v.payer) row("payer", v.payer);
   if (v.payment) row("payment", v.payment);
   if (v.receipt) row("receipt", v.receipt);
-  if (v.grant) row("grant id", v.grant);
-  row("confirmed", String(v.confirmed));
-  box.appendChild(rows);
+  if (v.grant) row("grant", v.grant);
+  if (current) row("policy", current.policy.id);
 
   const cc = $("crosscheck");
   cc.replaceChildren();
   if (!check) {
-    cc.className = "crosscheck";
-    cc.textContent = "checking independently…";
+    cc.className = "crosscheck muted";
+    cc.textContent = "checking independently\u2026";
     return;
   }
   if (check.serverOverclaimed) {
+    // The failure this whole design exists to make visible. It opens the fold
+    // by itself, because it is the one time a payer must read the details.
+    card.open = true;
     cc.className = "crosscheck disagree";
-    cc.appendChild(
-      el(
-        "b",
-        "",
-        "The server claimed this grant. This browser re-checked the ledger and it does not hold."
-      )
-    );
+    cc.appendChild(el("b", "", "Refused: the server claimed this grant, the ledger does not support it."));
     const ul = el("ul");
     for (const d of check.differences) ul.appendChild(el("li", "", d));
     cc.appendChild(ul);
-    cc.appendChild(el("div", "small", "Access refused locally. This is the failure mode holderPay is built to make visible."));
+    badge.className = "denied";
+    badge.textContent = "Refused \u2014 the server and the chain disagree";
   } else if (check.agrees) {
     cc.className = "crosscheck agree";
-    cc.textContent = "Verified independently in this browser: the server's answer matches the ledger.";
+    cc.textContent = "Re-verified in this browser: the server matches the ledger.";
   } else {
+    card.open = true;
     cc.className = "crosscheck disagree";
     cc.appendChild(el("b", "", "This browser and the server disagree."));
     const ul = el("ul");
@@ -281,7 +275,7 @@ async function payWithXno() {
   const p = current.policy;
   const amount = BigInt(p.priceXno!);
   try {
-    log(`paying ${fromRaw(amount, 30)} XNO to ${short(p.merchant)}…`);
+    status(`Paying ${fromRaw(amount, 30)} XNO\u2026`);
     await ensureHellos();
     const payment = await sendXno(rpc, keys, p.merchant, amount);
     log(`payment block ${short(payment)}`, "ok");
@@ -289,7 +283,7 @@ async function payWithXno() {
     log(`receipt block ${short(receipt)} — committed to policy ${short(p.id, 8)}`, "ok");
     await onPaid(receipt);
   } catch (e: any) {
-    log(`payment failed: ${e.message}`, "err");
+    status(e.message, "err");
   }
 }
 
@@ -297,7 +291,7 @@ async function payWithToken() {
   if (!current?.policy.token) return;
   const p = current.policy;
   try {
-    log(`transferring ${fromRaw(p.priceToken!, p.token!.decimals)} ${p.token!.symbol}…`);
+    status(`Paying ${fromRaw(p.priceToken!, p.token!.decimals)} ${p.token!.symbol}\u2026`);
     await ensureHellos();
     const r = await payTokenWithReceipt(
       rpc,
@@ -311,7 +305,7 @@ async function payWithToken() {
     log(`receipt block ${short(r.receipt)}`, "ok");
     await onPaid(r.receipt);
   } catch (e: any) {
-    log(`token payment failed: ${e.message}`, "err");
+    status(e.message, "err");
   }
 }
 
@@ -330,7 +324,7 @@ async function payWithSwap() {
     const have = BigInt(tokenView?.you?.balance ?? "0");
     if (have < want) {
       const missing = want - have;
-      log(`buying ${fromRaw(missing, p.token!.decimals)} ${p.token!.symbol} on the AMM…`);
+      status(`Swapping XNO for ${fromRaw(missing, p.token!.decimals)} ${p.token!.symbol}\u2026`);
       const st = await loadTokenState(true);
       const walletBalance = (await tip(rpc, keys.address)).balance;
       const plan: SwapPlan = planSwap({
@@ -349,12 +343,12 @@ async function payWithSwap() {
       log(`swap block ${short(h)}`, "ok");
       await loadTokenState(true);
     }
-    log(`paying the merchant in ${p.token!.symbol}…`);
+    status(`Paying in ${p.token!.symbol}\u2026`);
     const r = await payTokenWithReceipt(rpc, keys, p.token!.tokenId, p.merchant, want, memoLink(p.id));
     log(`receipt block ${short(r.receipt)}`, "ok");
     await onPaid(r.receipt);
   } catch (e: any) {
-    log(`swap payment failed: ${e.message}`, "err");
+    status(e.message, "err");
   }
 }
 
@@ -387,7 +381,7 @@ async function checkReceipt(receipt: string, forge = false) {
   renderVerdict(null, null);
   const theirs = await askServer(receipt, forge);
   renderVerdict(theirs, null);
-  log("re-verifying independently in this browser (replaying the ledger)…");
+  status("Verifying against the chain\u2026");
   const reader = new BrowserReader(current.policy.token?.tokenId ?? "", [
     keys.address,
     current.policy.merchant,
@@ -395,8 +389,8 @@ async function checkReceipt(receipt: string, forge = false) {
   ]);
   const check = await verifyLocally(current.policy, receipt, reader, theirs);
   renderVerdict(check.mine, check);
-  if (check.serverOverclaimed) log("the server claimed a grant the ledger does not support — refused", "err");
-  else if (check.agrees) log(check.mine.granted ? "verified: access is owed" : `not granted: ${check.mine.reason}`, check.mine.granted ? "ok" : "");
+  if (check.serverOverclaimed) status("Refused \u2014 the server and the chain disagree", "err");
+  else if (check.agrees) status(check.mine.granted ? "" : check.mine.reason, check.mine.granted ? "ok" : "");
   if (check.mine.granted && !forge) await claimAccess(receipt);
 }
 
@@ -413,15 +407,14 @@ async function claimAccess(receipt: string) {
     });
     const j = await res.json();
     if (j.unlock) {
-      const box = $("unlock");
-      box.hidden = false;
-      box.textContent = j.unlock;
-      log("access granted", "ok");
+      $("unlockCard").hidden = false;
+      $("unlock").textContent = j.unlock;
+      status("", "ok");
     } else {
-      log(`access refused: ${j.error}`, "err");
+      status(j.error, "err");
     }
   } catch (e: any) {
-    log(`could not claim access: ${e.message}`, "err");
+    status(e.message, "err");
   }
 }
 
@@ -534,11 +527,6 @@ function connectSocket() {
 // ── merchant panel ──────────────────────────────────────────────────────────
 
 function wireConfigPanel() {
-  $("toggleCfg").onclick = () => {
-    const p = $("cfgPanel");
-    p.hidden = !p.hidden;
-    $("toggleCfg").textContent = p.hidden ? "show" : "hide";
-  };
   ($("cfgMerchant") as HTMLInputElement).value = cfg.merchant;
   ($("cfgTokenId") as HTMLInputElement).value = cfg.tokenId;
 
@@ -568,8 +556,8 @@ function wireConfigPanel() {
       body: JSON.stringify(body),
     });
     const j = await res.json();
-    if (j.error) return log(`could not publish: ${j.error}`, "err");
-    log(`published offer ${short(j.policy.id, 8)}`, "ok");
+    if (j.error) return status(j.error, "err");
+    status("Published", "ok");
     await loadListings();
     await refreshBalances();
   };
@@ -590,16 +578,16 @@ async function main() {
   $("receiveBtn").onclick = async () => {
     try {
       const r = await receiveAll(rpc, keys);
-      log(r.count ? `received ${r.count} block(s)` : "nothing to receive", r.count ? "ok" : "");
+      status(r.count ? `Received ${r.count} block(s)` : "Nothing to receive", r.count ? "ok" : "");
       await refreshBalances();
     } catch (e: any) {
-      log(`receive failed: ${e.message}`, "err");
+      status(e.message, "err");
     }
   };
   $("recheck").onclick = () => checkReceipt(lastReceipt);
   $("tamperBtn").onclick = async () => {
-    if (!lastReceipt) return log("pay first — there is nothing to tamper with yet", "err");
-    log("asking the server to forge a grant…");
+    if (!lastReceipt) return status("Pay first \u2014 there is nothing to tamper with yet", "err");
+    status("Asking the server to forge a grant\u2026");
     await checkReceipt(lastReceipt, true);
   };
   $("switchOffer").onclick = () => {
@@ -609,10 +597,23 @@ async function main() {
     void refreshBalances();
   };
 
-  wireConfigPanel();
-  await loadListings();
-  await refreshBalances();
-  connectSocket();
+  // Each step is independent. Chaining them meant one failed render (a bad
+  // offer, a slow endpoint) took the wallet and the live socket down with it,
+  // leaving a page that looked merely empty rather than broken.
+  const step = async (name: string, fn: () => unknown) => {
+    try {
+      await fn();
+    } catch (e: any) {
+      log(`${name} failed: ${e?.message ?? e}`, "err");
+    }
+  };
+  await step("merchant panel", () => wireConfigPanel());
+  await step("offers", () => loadListings());
+  // The socket goes up BEFORE balances. Loading balances replays the token
+  // ledger, which can take seconds, and waiting for it meant the page could
+  // miss a confirmation for a payment made in that window.
+  await step("websocket", () => connectSocket());
+  await step("balances", () => refreshBalances());
 
   log(`wallet ${keys.address}`);
   log("chain access: rpc.nano.to only (proxied so the key stays server-side)");
