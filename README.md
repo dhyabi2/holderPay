@@ -88,6 +88,13 @@ other node, proxy, or work service, and no fallback endpoint
 ([`core/rpc.ts`](core/rpc.ts)). The vendored indexer's own fallback is
 repointed at nano.to by [a shim](vendor/hodl/lib/rpc.ts).
 
+**Proof of work follows the same rule, with the key, always.** Every
+`work_generate` goes to rpc.nano.to authenticated; there is no local generator
+and no WASM fallback. A nonce is validated against the threshold here and a bad
+one is retried against the same keyed endpoint, but nothing is ever computed on
+this machine — without a key, or without an answer, the operation fails loudly
+rather than quietly burning CPU that a public deployment cannot spare.
+
 That is safe because **every block is re-verified locally** — re-hashed and its
 signature checked against the account the node attributes it to. A single
 endpoint can omit data or stall; it cannot forge a block, an amount, or an

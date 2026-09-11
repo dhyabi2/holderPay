@@ -18,7 +18,6 @@
 
 import blakejsPkg from "blakejs";
 const { blake2b } = blakejsPkg;
-import * as nanocurrency from "nanocurrency";
 
 export const NANO_RPC = process.env.NANO_RPC_URL || "https://rpc.nano.to";
 export const NANO_WS = process.env.NANO_WS_URL || "wss://ws.nano.to";
@@ -69,9 +68,24 @@ async function callRpc(body: Record<string, unknown>, timeoutMs: number, key: st
 }
 
 // ── proof of work ───────────────────────────────────────────────────────────
-// rpc.nano.to serves work_generate, but it is known to hang and has served
-// invalid nonces, so every nonce is validated locally and a WASM generator
-// runs as the offline (not third-party) last resort.
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║ STRICT RULE (set by the owner, no exceptions):                          ║
+// ║   work_generate ALWAYS goes to rpc.nano.to WITH THE KEY. There is no    ║
+// ║   local generator, no WASM fallback, no unkeyed attempt. No key, or no  ║
+// ║   answer from the endpoint, means the operation FAILS — loudly.         ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+//
+// Why a fallback was wrong, not merely unnecessary: computing PoW here burns
+// this process's CPU, and the cost is exponential in the difficulty bits. On a
+// public deployment that turns /api/rpc into a CPU-exhaustion lever that costs
+// the attacker a for-loop, and on any box it stalls the event loop for every
+// other request mid-payment. The key exists precisely so this machine never
+// does that work.
+//
+// The endpoint is known to hang and has served invalid nonces, so each nonce is
+// still validated locally (validateWork) and a bad one is retried against the
+// same keyed endpoint. Retrying one endpoint is persistence, not a fallback:
+// no other service is ever contacted, and no work is ever computed here.
 
 /** Nano PoW check: blake2b-8(work_le ‖ root) read as LE u64 >= threshold. */
 export function validateWork(workHex: string, rootHex: string, difficultyHex: string): boolean {
@@ -99,35 +113,49 @@ function cachePut(root: string, difficulty: string, work: string) {
   workCache.set(`${root.toLowerCase()}|${difficulty.toLowerCase()}`, work);
 }
 
+/** How many times to re-ask the keyed endpoint before giving up. */
+const WORK_ATTEMPTS = 3;
+
 async function generateWork(root: string, difficulty: string, key: string): Promise<{ work: string; difficulty: string; source: string }> {
   const cached = cacheGet(root, difficulty);
   if (cached) return { work: cached, difficulty, source: "cache" };
 
-  try {
-    const json = await callRpc({ action: "work_generate", hash: root, difficulty }, WORK_TIMEOUT_MS, key);
-    const w = String(json?.work ?? "").trim();
-    if (w && validateWork(w, root, difficulty)) {
-      cachePut(root, difficulty, w);
-      return { work: w, difficulty, source: "rpc" };
-    }
-  } catch {
-    /* fall through to local */
+  // No key, no work. Failing here is the point: an unkeyed request would either
+  // be refused or silently fall into some other way of producing a nonce, and
+  // the rule is that there is no other way.
+  if (!key) {
+    throw new Error(
+      "work_generate requires NANO_RPC_KEY — proof of work is never computed locally (set it in .env)"
+    );
   }
 
-  // Offline WASM generator — local CPU, not a third-party service, so the
-  // single-endpoint rule still holds.
-  const work = await nanocurrency.computeWork(root, { workThreshold: difficulty });
-  if (!work) throw new Error("work generation failed");
-  cachePut(root, difficulty, work);
-  return { work, difficulty, source: "local" };
+  let last = "";
+  for (let i = 0; i < WORK_ATTEMPTS; i++) {
+    try {
+      const json = await callRpc({ action: "work_generate", hash: root, difficulty }, WORK_TIMEOUT_MS, key);
+      const w = String(json?.work ?? "").trim();
+      if (w && validateWork(w, root, difficulty)) {
+        cachePut(root, difficulty, w);
+        return { work: w, difficulty, source: "rpc" };
+      }
+      // A nonce that does not meet the threshold is the endpoint being wrong,
+      // not us being unlucky. Say so, rather than reporting a timeout.
+      last = w ? `endpoint returned a nonce that fails the ${difficulty} threshold` : "endpoint returned no nonce";
+    } catch (e: any) {
+      last = e?.message ?? String(e);
+    }
+  }
+
+  throw new Error(`work_generate failed after ${WORK_ATTEMPTS} attempts against ${NANO_RPC}: ${last}`);
 }
 
-/** One JSON-RPC call against rpc.nano.to. work_generate is served by the
- * layered generator above (validated, with an offline last resort). */
+/** One JSON-RPC call against rpc.nano.to. work_generate is served by the keyed
+ * generator above -- validated locally, retried, and never computed here. */
 export async function nanoRpc(key: string, body: Record<string, unknown>): Promise<any> {
   if (body.action === "work_generate" && typeof body.hash === "string") {
-    // Clamp caller-supplied difficulty: local PoW cost is EXPONENTIAL in the
-    // leading bits, so an unclamped value would wedge the event loop.
+    // Clamp caller-supplied difficulty. Nothing is computed here any more, so
+    // this no longer guards our CPU -- it stops a caller from spending the
+    // key's quota on an absurd threshold that no sane block needs.
     const raw =
       typeof body.difficulty === "string" && /^[0-9a-fA-F]{16}$/.test(body.difficulty)
         ? body.difficulty

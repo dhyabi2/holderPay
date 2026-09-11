@@ -64,17 +64,17 @@ const ALLOWED_ACTIONS = new Set([
 ]);
 
 // `work_generate` is the expensive one and needs its own, much tighter budget.
-// Proof-of-work cost is exponential in the difficulty bits, and when
-// rpc.nano.to is slow core/rpc.ts falls back to generating it on THIS machine's
-// CPU. Under the general read limit, one client could pin every core and stall
-// the event loop for everyone -- a denial of service that costs the attacker a
-// for-loop. A legitimate payment needs two or three nonces, so a handful a
-// minute is generous, and a global cap bounds the damage from a botnet.
+// It is never computed on this machine -- core/rpc.ts sends every nonce request
+// to rpc.nano.to with the key, and fails rather than falling back (see the
+// strict rule there). So what these limits protect is the KEY'S QUOTA, not our
+// CPU: without them one client could burn the whole allowance and take the
+// payment path down for everyone. A legitimate payment needs two or three
+// nonces, so a handful a minute is generous, and a global cap bounds a botnet.
 const WORK_PER_IP_PER_MIN = 12;
 const WORK_GLOBAL_PER_MIN = 120;
 
 // Crude per-key limiter: enough to stop a stray loop, or a cheap DoS, from
-// burning the RPC quota or the CPU. In-memory, so it resets on restart and does
+// burning the RPC quota. In-memory, so it resets on restart and does
 // not span instances -- adequate for one box, not for a fleet.
 const hits = new Map<string, { n: number; until: number }>();
 function rateLimit(key: string, max: number, windowMs: number): boolean {
