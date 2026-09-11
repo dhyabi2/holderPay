@@ -38,6 +38,20 @@ try {
 }
 fs.writeFileSync(p("server", "catalog.baked.json"), JSON.stringify(catalog, null, 2));
 
+// ── the token catalogue, baked in ────────────────────────────────────────────
+// Built offline by scripts/snapshot-tokens.ts, because folding every chain that
+// ever touched a token measured at over twenty minutes and the platform kills an
+// invocation at sixty seconds. DISPLAY ONLY -- see server/snapshot.ts. A missing
+// snapshot is not an error: the deployment simply shows what it can replay.
+let snapshot = null;
+try {
+  snapshot = JSON.parse(fs.readFileSync(p("data", "tokens.snapshot.json"), "utf-8"));
+} catch {
+  console.warn("! no data/tokens.snapshot.json -- the catalogue will show only what a live fold sees");
+  console.warn("  (build one with: node --experimental-strip-types scripts/snapshot-tokens.ts)");
+}
+fs.writeFileSync(p("server", "tokens.baked.json"), JSON.stringify(snapshot ?? { at: "", accounts: 0, tokens: [] }));
+
 // ── the function ─────────────────────────────────────────────────────────────
 fs.mkdirSync(p("api"), { recursive: true });
 const out = p("api", "[...path].js");
@@ -86,6 +100,10 @@ const size = (f) => (fs.statSync(f).size / 1024).toFixed(0) + " kB";
 console.log(`  api/[...path].js  ${size(out)}`);
 for (const f of assets) console.log(`  public/${f.padEnd(16)} ${size(path.join(pub, f))}`);
 console.log(`  catalog           ${catalog.listings.length} offer(s) baked in`);
+console.log(
+  `  token catalogue   ${snapshot?.tokens?.length ?? 0} token(s)` +
+    (snapshot?.at ? ` as of ${snapshot.at}` : " (none -- live fold only)")
+);
 
 // ── the check that matters ───────────────────────────────────────────────────
 // A bundle is a new way to leak a key: one careless import of core/env.ts

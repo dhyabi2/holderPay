@@ -7541,6 +7541,7 @@ var listings = [];
 var current = null;
 var keys;
 var tokenView = null;
+var catalogueAt = "";
 var myTokens = [];
 var lastReceipt = "";
 var SEED_KEY = "holderpay.seed.v1";
@@ -7717,21 +7718,25 @@ function renderPayActions() {
       const priceXno = BigInt(any.priceXno);
       const minBacking = BigInt(any.minBacking ?? "0");
       const listed = new Set(acceptedTokens(p).map((a2) => a2.tokenId));
-      const others = myTokens.filter((t) => !listed.has(t.tokenId) && BigInt(t.balance || "0") > 0n).sort((x2, y) => BigInt(y.backedHoldingValue || "0") > BigInt(x2.backedHoldingValue || "0") ? 1 : -1);
+      const mine = myTokens.filter((t) => !listed.has(t.tokenId) && BigInt(t.balance || "0") > 0n);
+      const rest = myTokens.filter((t) => !listed.has(t.tokenId) && BigInt(t.balance || "0") === 0n);
+      const byValue = (x2, y) => BigInt(y.backedHoldingValue || "0") > BigInt(x2.backedHoldingValue || "0") ? 1 : -1;
+      const byBacking = (x2, y) => BigInt(y.backing || "0") > BigInt(x2.backing || "0") ? 1 : -1;
+      const others = [...mine.sort(byValue), ...rest.sort(byBacking)];
       for (const t of others) {
         const need = openTokenNeed(t, priceXno);
         const have = BigInt(t.balance || "0");
         const backing = BigInt(t.backing || "0");
         const sym = t.symbol || t.tokenId.slice(0, 6);
         const belowMin = backing < minBacking;
-        const usable = need !== null && !belowMin && have >= need;
+        const usable = need !== null && !belowMin && have >= need && !t.stale;
         box.appendChild(
           tokenButton({
             tokenId: t.tokenId,
             symbol: sym,
             amount: need === null ? "\u2014" : fromRaw(need, t.decimals),
-            note: need === null ? "nothing behind it" : belowMin ? "below this offer's minimum" : have >= need ? `you hold ${fromRaw(have, t.decimals)}` : `${fromRaw(need - have, t.decimals)} short`,
-            hint: need === null ? `${sym} has no collateral behind it, so no amount of it can pay for anything here` : `priced by real collateral: ${sym} is backed by ${fromRaw(backing, 30)} XNO across ${fromRaw(t.circulating, t.decimals)} circulating`,
+            note: t.stale ? "not in this verifier's replay" : need === null ? "nothing behind it" : belowMin ? "below this offer's minimum" : have >= need ? `you hold ${fromRaw(have, t.decimals)}` : have > 0n ? `${fromRaw(need - have, t.decimals)} short` : "you hold none",
+            hint: t.stale ? `${sym} is in the catalogue from ${catalogueAt || "an earlier build"}, but this verifier has not replayed it. Hold some and it comes into the replay with your own chain.` : need === null ? `${sym} has no collateral behind it, so no amount of it can pay for anything here` : `priced by real collateral: ${sym} is backed by ${fromRaw(backing, 30)} XNO across ${fromRaw(t.circulating, t.decimals)} circulating`,
             disabled: !usable,
             open: true,
             onClick: () => payWithToken({ tokenId: t.tokenId, symbol: sym, decimals: t.decimals, price: need.toString() })
@@ -7979,6 +7984,7 @@ async function loadTokens() {
   const res = await fetch(`/api/tokens?account=${encodeURIComponent(keys.address)}&t=${Date.now()}`);
   const j2 = await res.json();
   myTokens = Array.isArray(j2.tokens) ? j2.tokens : [];
+  catalogueAt = j2.catalogue?.at ? new Date(j2.catalogue.at).toLocaleString() : "";
   const top = myTokens.find((t) => BigInt(t.balance) > 0n);
   $2("balTok").textContent = top ? fromRaw(top.balance, top.decimals) : "0";
   $2("balTokLabel").textContent = top ? top.symbol : cfg.symbol || "tokens";

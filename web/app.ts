@@ -83,6 +83,7 @@ let current: Listing | null = null;
 let keys: Keys;
 let tokenView: any = null;
 /** Every token this browser can see, sorted by real collateral, richest first. */
+let catalogueAt = "";
 let myTokens: TokenRow[] = [];
 let lastReceipt = "";
 
@@ -349,9 +350,17 @@ function renderPayActions() {
       const priceXno = BigInt(any.priceXno);
       const minBacking = BigInt(any.minBacking ?? "0");
       const listed = new Set(acceptedTokens(p).map((a) => a.tokenId));
-      const others = myTokens
-        .filter((t) => !listed.has(t.tokenId) && BigInt(t.balance || "0") > 0n)
-        .sort((x, y) => (BigInt(y.backedHoldingValue || "0") > BigInt(x.backedHoldingValue || "0") ? 1 : -1));
+      // Everything the payer holds, then everything else this verifier knows
+      // about. The second group cannot be paid with -- not because the offer
+      // refuses it, but because a payment needs a balance, and a balance is a
+      // thing you have or do not. They are shown so the catalogue is the whole
+      // catalogue rather than a wallet with a misleading title.
+      const mine = myTokens.filter((t) => !listed.has(t.tokenId) && BigInt(t.balance || "0") > 0n);
+      const rest = myTokens.filter((t) => !listed.has(t.tokenId) && BigInt(t.balance || "0") === 0n);
+      const byValue = (x: any, y: any) =>
+        BigInt(y.backedHoldingValue || "0") > BigInt(x.backedHoldingValue || "0") ? 1 : -1;
+      const byBacking = (x: any, y: any) => (BigInt(y.backing || "0") > BigInt(x.backing || "0") ? 1 : -1);
+      const others = [...mine.sort(byValue), ...rest.sort(byBacking)];
 
       for (const t of others) {
         const need = openTokenNeed(t, priceXno);
@@ -359,22 +368,32 @@ function renderPayActions() {
         const backing = BigInt(t.backing || "0");
         const sym = t.symbol || t.tokenId.slice(0, 6);
         const belowMin = backing < minBacking;
-        const usable = need !== null && !belowMin && have >= need;
+        // `stale` means the row came from the build-time catalogue rather than
+        // a replay just now. Such a token can still be paid with -- but only
+        // after this verifier has folded it, which happens when the payer's own
+        // chain brings it into the watch set. Until then the honest state is
+        // "known about, not replayed", and offering a pay button would promise
+        // a verdict this server cannot currently reach.
+        const usable = need !== null && !belowMin && have >= need && !t.stale;
         box.appendChild(
           tokenButton({
             tokenId: t.tokenId,
             symbol: sym,
             amount: need === null ? "\u2014" : fromRaw(need, t.decimals),
-            note:
-              need === null
+            note: t.stale
+              ? "not in this verifier's replay"
+              : need === null
                 ? "nothing behind it"
                 : belowMin
                   ? "below this offer's minimum"
                   : have >= need
                     ? `you hold ${fromRaw(have, t.decimals)}`
-                    : `${fromRaw(need - have, t.decimals)} short`,
-            hint:
-              need === null
+                    : have > 0n
+                      ? `${fromRaw(need - have, t.decimals)} short`
+                      : "you hold none",
+            hint: t.stale
+              ? `${sym} is in the catalogue from ${catalogueAt || "an earlier build"}, but this verifier has not replayed it. Hold some and it comes into the replay with your own chain.`
+              : need === null
                 ? `${sym} has no collateral behind it, so no amount of it can pay for anything here`
                 : `priced by real collateral: ${sym} is backed by ${fromRaw(backing, 30)} XNO across ${fromRaw(t.circulating, t.decimals)} circulating`,
             disabled: !usable,
@@ -665,6 +684,10 @@ async function loadTokens() {
   const res = await fetch(`/api/tokens?account=${encodeURIComponent(keys.address)}&t=${Date.now()}`);
   const j = await res.json();
   myTokens = Array.isArray(j.tokens) ? j.tokens : [];
+  // When the catalogue was folded. Shown rather than hidden: a payer reading a
+  // backing figure deserves to know whether it was computed a second ago or
+  // last Tuesday.
+  catalogueAt = j.catalogue?.at ? new Date(j.catalogue.at).toLocaleString() : "";
 
   // The wallet line shows the buyer's most valuable holding, whatever it is.
   const top = myTokens.find((t) => BigInt(t.balance) > 0n);

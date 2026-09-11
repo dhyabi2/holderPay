@@ -35,6 +35,7 @@ import { tokenList, viewToken, type SortKey, type TokenLabels } from "../core/va
 import { planSwap, quoteBuy } from "../core/swap.ts";
 import { ANCHOR_PUB } from "../vendor/hodl/core/anchor.ts";
 import * as catalog from "./catalog.ts";
+import { snapshot, ageMs } from "./snapshot.ts";
 import { watcher } from "./watch.ts";
 
 loadEnv();
@@ -570,9 +571,36 @@ export async function handle(req: http.IncomingMessage, res: http.ServerResponse
       const sort = (url.searchParams.get("sort") ?? "backedHoldingValue") as SortKey;
       const held = url.searchParams.get("held") === "1";
       const f = await currentFold(account ? [account] : []);
-      let tokens = tokenList(f, account, sort, tokenLabels());
+      const live = tokenList(f, account, sort, tokenLabels());
+
+      // The live fold sees what this verifier watches: the merchant, the
+      // creator, whoever greeted holderPay's anchor, and the payer's own chain.
+      // It cannot see the whole of hodlgame, because replaying every chain that
+      // ever touched a token measured at over twenty minutes against a sixty
+      // second ceiling. The rest of the catalogue therefore comes from a build
+      // time snapshot, and every row says which it is.
+      //
+      // A live row ALWAYS wins over a snapshot row for the same token: the live
+      // one is current, and it is the only one whose numbers a payment can be
+      // built on. Snapshot rows carry no balance, because a balance nobody
+      // replayed just now is a rumour.
+      const seen = new Set(live.map((t) => t.tokenId));
+      const snap = snapshot();
+      const extra = (snap?.tokens ?? [])
+        .filter((t) => !seen.has(t.tokenId))
+        .map((t) => ({ ...t, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0", stale: true }));
+
+      let tokens: any[] = [...live.map((t) => ({ ...t, stale: false })), ...extra];
       if (held && account) tokens = tokens.filter((t) => BigInt(t.balance) > 0n);
-      return json(res, 200, { tokens, watched: f.accounts.length, foldAt: f.at, sort });
+      return json(res, 200, {
+        tokens,
+        watched: f.accounts.length,
+        foldAt: f.at,
+        sort,
+        // So the page can say "as of ..." instead of implying everything here
+        // was checked a moment ago.
+        catalogue: snap ? { at: snap.at, accounts: snap.accounts, tokens: snap.tokens.length, ageMs: ageMs() } : null,
+      });
     }
 
     // ---- one token's state (for quoting and display) -----------------------

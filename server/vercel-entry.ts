@@ -27,12 +27,17 @@ import "./vercel-env.ts"; // MUST be first: see the note in that file
 import type * as http from "node:http";
 import { handle } from "./index.ts";
 import { seedReadOnly, type Listing } from "./catalog.ts";
+import { seed as seedSnapshot } from "./snapshot.ts";
 // Baked at build time by scripts/build-vercel.mjs, which copies the live
 // data/catalog.json next to this file. A deployment therefore carries its shop
 // with it and needs no storage at all.
 import baked from "./catalog.baked.json" with { type: "json" };
+// The token catalogue, folded offline. Display only -- server/snapshot.ts says
+// why, and core/verify.ts never reaches it.
+import bakedTokens from "./tokens.baked.json" with { type: "json" };
 
 seedReadOnly(((baked as any)?.listings ?? []) as Listing[]);
+seedSnapshot((bakedTokens as any)?.tokens?.length ? (bakedTokens as any) : null);
 
 export default function (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   return handle(req, res);

@@ -3055,8 +3055,8 @@ if (!process.env.CHALLENGE_SECRET) {
 
 // server/index.ts
 import * as http from "node:http";
-import * as fs3 from "node:fs";
-import * as path3 from "node:path";
+import * as fs4 from "node:fs";
+import * as path4 from "node:path";
 import * as crypto2 from "node:crypto";
 
 // core/env.ts
@@ -5823,6 +5823,35 @@ function put(input, unlock) {
   return listing;
 }
 
+// server/snapshot.ts
+import * as fs3 from "node:fs";
+import * as path3 from "node:path";
+var baked = null;
+var fileChecked = false;
+var fromFile = null;
+function seed(s) {
+  baked = s && Array.isArray(s.tokens) ? s : null;
+}
+function snapshot() {
+  if (baked) return baked;
+  if (!fileChecked) {
+    fileChecked = true;
+    try {
+      const raw = fs3.readFileSync(path3.resolve(process.cwd(), "data", "tokens.snapshot.json"), "utf-8");
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed?.tokens)) fromFile = parsed;
+    } catch {
+    }
+  }
+  return fromFile;
+}
+function ageMs() {
+  const s = snapshot();
+  if (!s?.at) return null;
+  const t = Date.parse(s.at);
+  return Number.isFinite(t) ? Date.now() - t : null;
+}
+
 // server/watch.ts
 import WebSocket from "ws";
 var ConfirmationWatcher = class {
@@ -5927,7 +5956,7 @@ var watcher = new ConfirmationWatcher();
 loadEnv();
 var PORT = Number(env("PORT", "8787"));
 var HOST = env("HOST", "127.0.0.1");
-var WEB = path3.resolve(process.cwd(), "web");
+var WEB = path4.resolve(process.cwd(), "web");
 var TOKEN_ID = env("TEACHER_TOKEN_ID");
 var MERCHANT = env("MERCHANT_ADDRESS");
 var isLoopback = (h) => h === "127.0.0.1" || h === "::1" || h === "localhost";
@@ -6113,10 +6142,10 @@ async function handle(req, res) {
   });
   try {
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-      return serveFile(res, path3.join(WEB, "index.html"), "text/html; charset=utf-8");
+      return serveFile(res, path4.join(WEB, "index.html"), "text/html; charset=utf-8");
     }
     if (req.method === "GET" && /^\/[a-zA-Z0-9._-]+\.(js|css|svg|png|ico|map)$/.test(url.pathname)) {
-      const file = path3.join(WEB, url.pathname.slice(1));
+      const file = path4.join(WEB, url.pathname.slice(1));
       const type = url.pathname.endsWith(".js") ? "text/javascript; charset=utf-8" : url.pathname.endsWith(".css") ? "text/css; charset=utf-8" : url.pathname.endsWith(".svg") ? "image/svg+xml" : "application/octet-stream";
       return serveFile(res, file, type);
     }
@@ -6229,9 +6258,21 @@ async function handle(req, res) {
       const sort = url.searchParams.get("sort") ?? "backedHoldingValue";
       const held = url.searchParams.get("held") === "1";
       const f = await currentFold(account ? [account] : []);
-      let tokens2 = tokenList(f, account, sort, tokenLabels());
+      const live = tokenList(f, account, sort, tokenLabels());
+      const seen = new Set(live.map((t) => t.tokenId));
+      const snap = snapshot();
+      const extra = (snap?.tokens ?? []).filter((t) => !seen.has(t.tokenId)).map((t) => ({ ...t, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0", stale: true }));
+      let tokens2 = [...live.map((t) => ({ ...t, stale: false })), ...extra];
       if (held && account) tokens2 = tokens2.filter((t) => BigInt(t.balance) > 0n);
-      return json(res, 200, { tokens: tokens2, watched: f.accounts.length, foldAt: f.at, sort });
+      return json(res, 200, {
+        tokens: tokens2,
+        watched: f.accounts.length,
+        foldAt: f.at,
+        sort,
+        // So the page can say "as of ..." instead of implying everything here
+        // was checked a moment ago.
+        catalogue: snap ? { at: snap.at, accounts: snap.accounts, tokens: snap.tokens.length, ageMs: ageMs() } : null
+      });
     }
     if (route === "GET /api/token") {
       const account = url.searchParams.get("account") ?? "";
@@ -6377,10 +6418,10 @@ function harden(res) {
   if (PUBLIC_BIND) res.setHeader("strict-transport-security", "max-age=31536000");
 }
 function serveFile(res, file, type) {
-  fs3.readFile(file, (err, data) => {
+  fs4.readFile(file, (err, data) => {
     if (err) {
       res.writeHead(404, { "content-type": "text/plain" });
-      return res.end("not found: " + path3.basename(file));
+      return res.end("not found: " + path4.basename(file));
     }
     res.writeHead(200, {
       "content-type": type,
@@ -6483,8 +6524,12 @@ var catalog_baked_default = {
   ]
 };
 
+// server/tokens.baked.json
+var tokens_baked_default = { at: "2026-09-11T17:55:11.343Z", tookMs: 66755, accounts: 58, tokens: [{ tokenId: "4709abf5cf2685b2d0b7305f12856779", symbol: "4709ab", name: "", decimals: 6, supply: "999999887684804", poolXno: "436124556038898537600475495843612", poolTokens: "289148401383602", creator: "nano_1bwt9kgto81mowsi93cgtq73t43a1buerdbgrcasq76z65rturznrny79zg7", holders: 10, direct: true, quotedPrice: "1508306993751312351831005", quotedValue: "1508306824345516720481582946879714", backing: "308419024739129800298088449218758", circulating: "999999887684804", backedPct: 20.448, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "b56f256ff88bf377468c1dabda1b9a9e", symbol: "b56f25", name: "", decimals: 6, supply: "100000000000000", poolXno: "11637690936945832339567499891039", poolTokens: "8398671341873", creator: "nano_3sfk41ebrodgt4w411ysybofx6ipnbkm91xk8izhpmxyp8on881qonpknz5d", holders: 4, direct: true, quotedPrice: "1385658571841494851792638", quotedValue: "138565857184149485179263800000000", backing: "10412979644064370067118031800863", circulating: "100000000000000", backedPct: 7.5148, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "dc785abdf56742927b59d5789eb0b25c", symbol: "dc785a", name: "", decimals: 6, supply: "1000000000000000", poolXno: "112845974000000000000000000000000", poolTokens: "453584061533624", creator: "nano_3twewtcb4qhjep1dapao4tcc7j4kp74h3tupf5xnio46wp3py4d8ffq8ggy1", holders: 8, direct: true, quotedPrice: "248787344110932289320783", quotedValue: "248787344110932289320783000000000", backing: "10406040247463878339337785564757", circulating: "550000000000000", backedPct: 4.1827, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "84d9e78fd93e7c70c8bea00d86120c4c", symbol: "84d9e7", name: "", decimals: 6, supply: "1000000000000000", poolXno: "110000000000000000000000000000000", poolTokens: "888849412584308", creator: "nano_1cexacexqrr51coik9eeqzebmfej7g6chrd1eygmzm9ad86qek84pnhpda1t", holders: 12, direct: true, quotedPrice: "123755496085864175149008", quotedValue: "123755496085864175149008000000000", backing: "7080594332343080795132763834728", circulating: "1000000000000000", backedPct: 5.7214, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "28f52bff968e3d84391e0a07f98ec6bd", symbol: "28f52b", name: "", decimals: 6, supply: "399000000000000", poolXno: "9998387646762490174440541076867", poolTokens: "1281247439", creator: "nano_1spr8bbkjrrs5zknm3mkhwqxueqf6jf7173iu9jh5ri7msck55wcwxtg8e9i", holders: 5, direct: true, quotedPrice: "7803635224875942307690763764", quotedValue: "3113650454725500980768614741836000000", backing: "6168882584608523198766651516361", circulating: "19953000000000", backedPct: 1e-4, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "8deae33fd67097dd44b940e0e1308ac3", symbol: "8deae3", name: "", decimals: 6, supply: "1000000000000000", poolXno: "4100000000000000000000000000000", poolTokens: "513694999329375", creator: "nano_16pokt5ugh13hcm1bmuakszxxs1ioki6p3i6m458gbo4d9q7qfbktfh1stk5", holders: 2, direct: true, quotedPrice: "7981389745573773344349", quotedValue: "7981389745573773344349000000000", backing: "1912698421099129147341642319800", circulating: "1000000000000000", backedPct: 23.9644, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "a0943e91ba202e7298a783de1c468082", symbol: "a0943e", name: "", decimals: 6, supply: "21000000000000", poolXno: "3000000000000000000000000000000", poolTokens: "11922692139389", creator: "nano_314738ebtt9htzs5tx76z1zzurhe7jgwd7ndeoupjfb3kqdrer7im8cr1z8h", holders: 2, direct: true, quotedPrice: "251621023584841170394452", quotedValue: "5284041495281664578283492000000", backing: "1207113964001537572887829279942", circulating: "21000000000000", backedPct: 22.8445, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "3eb93c9cf3b8a7d849fade3a54cc0b97", symbol: "3eb93c", name: "", decimals: 6, supply: "1000000000000000", poolXno: "3293664885022464021775310033033", poolTokens: "699926061070661", creator: "nano_3gkbxrzwoqpx7bmtxfao7yju5t1hwsm1bcnmwgp68cj9znce1nisw15acup8", holders: 2, direct: true, quotedPrice: "4705732602646941946543", quotedValue: "4705732602646941946543000000000", backing: "889535558830874687934806287409", circulating: "1000000000000000", backedPct: 18.9032, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "a96c4ed6af79a795f68182d051be48e1", symbol: "a96c4e", name: "", decimals: 6, supply: "1000000000000", poolXno: "514787347001397206739442346487", poolTokens: "18703977087", creator: "nano_1iaaroiz9syfy4esw5con61tua3x4qqyip9oshgru5ox1texh5b674nqcfwz", holders: 4, direct: true, quotedPrice: "27522881609986288299575820", quotedValue: "27522881609986288299575820000000", backing: "504601691688230806127098119781", circulating: "1000000000000", backedPct: 1.8333, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "6d7e02143109754003a34c14d238dbf0", symbol: "6d7e02", name: "", decimals: 6, supply: "1000000000000000", poolXno: "100100000000000000000000000000000", poolTokens: "949060430174128", creator: "nano_3obz5p4y6tijgxsyp8wowbzr6fppfmu4a99xmmk814cdkqx537j8o9n8wtb4", holders: 1, direct: true, quotedPrice: "105472735789473641275351", quotedValue: "105472735789473641275351000000000", backing: "100000000000000000000000000000", circulating: "1000000000000000", backedPct: 0.0948, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "04239330a506f91f37b53166df1e56ec", symbol: "042393", name: "", decimals: 6, supply: "1000000000000", poolXno: "20076852364349241215445246862", poolTokens: "99621022651", creator: "nano_37896e5ah3o9myy378qzgi5dwxps4fu69d9mpucqb3imqkd4yshru5fbkzxm", holders: 3, direct: true, quotedPrice: "201532285355913367850669", quotedValue: "201532285355913367850669000000", backing: "75286660224889601395347779", circulating: "150000000000", backedPct: 0.0373, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "78e7ba60509a47475350f2f3c9134445", symbol: "78e7ba", name: "", decimals: 6, supply: "999500000", poolXno: "160027814494293151169168932", poolTokens: "348464459", creator: "nano_1fcbzc7yxqp1zy5ywo8rkq5pzdw8cgnc3hucpsmw6zhx999tfk3nofb5tge4", holders: 4, direct: true, quotedPrice: "459237119772645597607901", quotedValue: "459007501212759274809097049", backing: "45027535699240832275852147", circulating: "550500000", backedPct: 9.8097, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "cb9b91d6f52deb3541ae3988c42cb78b", symbol: "cb9b91", name: "", decimals: 6, supply: "1000000000000", poolXno: "10000404056627525180669074381", poolTokens: "99996000000", creator: "nano_37896e5ah3o9myy378qzgi5dwxps4fu69d9mpucqb3imqkd4yshru5fbkzxm", holders: 2, direct: true, quotedPrice: "100008040887910768237420", quotedValue: "100008040887910768237420000000", backing: "100007040777498576763993", circulating: "150000000000", backedPct: 0, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "3607cd6ff3a0f4345a2192b67fdc0024", symbol: "3607cd", name: "", decimals: 6, supply: "100000000000000", poolXno: "0", poolTokens: "0", creator: "nano_35tu4kcxfxnxfgxx5p8a7mfxy5ntfaksnf5ocwdh56zmwmksyrdp1iug7bxx", holders: 1, direct: false, quotedPrice: "0", quotedValue: "0", backing: "0", circulating: "5000000000000", backedPct: null, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "3bb4966ab2fd0eb47072ce0108f67f8e", symbol: "3bb496", name: "", decimals: 6, supply: "100000000000000", poolXno: "0", poolTokens: "0", creator: "nano_35tu4kcxfxnxfgxx5p8a7mfxy5ntfaksnf5ocwdh56zmwmksyrdp1iug7bxx", holders: 1, direct: false, quotedPrice: "0", quotedValue: "0", backing: "0", circulating: "5000000000000", backedPct: null, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "3fd713ab3cb2ce7943f6b849053d4329", symbol: "3fd713", name: "", decimals: 6, supply: "1000000000000", poolXno: "10987289440951996076845", poolTokens: "865422202002", creator: "nano_1z3ryire4dayu63w1ic9qm7dkapu46msaogohu7mq5f8t5z155orbpgccfjn", holders: 1, direct: false, quotedPrice: "12695871928793669", quotedValue: "12695871928793669000000", backing: "0", circulating: "1000000000000", backedPct: 0, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "4af130e7da9ee1d80fef8e8cdd2dc282", symbol: "4af130", name: "", decimals: 6, supply: "1000000000000", poolXno: "1000000000000000000000000000000000000", poolTokens: "900000000000", creator: "nano_3fmenhou8hg1q4x6m7mh4qqp7rsgkbfaa7q5a94q7py6i54kafnnemtrydb1", holders: 2, direct: true, quotedPrice: "1111111111111111111111111111111", quotedValue: "1111111111111111111111111111111000000", backing: "0", circulating: "950000000000", backedPct: 0, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "5269273a3bda86b0093ecb651b608cdd", symbol: "526927", name: "", decimals: 6, supply: "1000000000000", poolXno: "10987289440951996076845", poolTokens: "865422202002", creator: "nano_1z3ryire4dayu63w1ic9qm7dkapu46msaogohu7mq5f8t5z155orbpgccfjn", holders: 2, direct: false, quotedPrice: "12695871928793669", quotedValue: "12695871928793669000000", backing: "0", circulating: "1000000000000", backedPct: 0, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "6e2d2dd2961618a125d095380162c1ff", symbol: "6e2d2d", name: "", decimals: 6, supply: "80376237800000", poolXno: "119364375200218689509251949586", poolTokens: "80376237800000", creator: "nano_1iaaroiz9syfy4esw5con61tua3x4qqyip9oshgru5ox1texh5b674nqcfwz", holders: 0, direct: true, quotedPrice: "1485070444541492205912", quotedValue: "119364375200218689509229477873", backing: "0", circulating: "80376237800000", backedPct: 0, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "7a985d9627f7279bd022cb989cecd3d3", symbol: "7a985d", name: "", decimals: 6, supply: "100000000000000", poolXno: "0", poolTokens: "0", creator: "nano_35tu4kcxfxnxfgxx5p8a7mfxy5ntfaksnf5ocwdh56zmwmksyrdp1iug7bxx", holders: 1, direct: false, quotedPrice: "0", quotedValue: "0", backing: "0", circulating: "5000000000000", backedPct: null, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "adc44bc37a9b5b46722e4009c3a6f32d", symbol: "adc44b", name: "", decimals: 6, supply: "100000000000000", poolXno: "0", poolTokens: "0", creator: "nano_35tu4kcxfxnxfgxx5p8a7mfxy5ntfaksnf5ocwdh56zmwmksyrdp1iug7bxx", holders: 1, direct: false, quotedPrice: "0", quotedValue: "0", backing: "0", circulating: "5000000000000", backedPct: null, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "ca386f29c79f778e31b1c19d7c8125ad", symbol: "ca386f", name: "", decimals: 6, supply: "1000000000000", poolXno: "1000000000000000000000000000000000000", poolTokens: "900000000000", creator: "nano_3fmenhou8hg1q4x6m7mh4qqp7rsgkbfaa7q5a94q7py6i54kafnnemtrydb1", holders: 2, direct: true, quotedPrice: "1111111111111111111111111111111", quotedValue: "1111111111111111111111111111111000000", backing: "0", circulating: "950000000000", backedPct: 0, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }, { tokenId: "cd864f9bb7efcdfcdeb23d8f3d68834d", symbol: "cd864f", name: "", decimals: 6, supply: "999500000", poolXno: "210536802176635630573746259", poolTokens: "23998401", creator: "nano_1fcbzc7yxqp1zy5ywo8rkq5pzdw8cgnc3hucpsmw6zhx999tfk3nofb5tge4", holders: 3, direct: false, quotedPrice: "8772951255237198118897432", quotedValue: "8768564779609579519837983284", backing: "0", circulating: "549500000", backedPct: 0, balance: "0", quotedHoldingValue: "0", backedHoldingValue: "0" }] };
+
 // server/vercel-entry.ts
 seedReadOnly(catalog_baked_default?.listings ?? []);
+seed(tokens_baked_default?.tokens?.length ? tokens_baked_default : null);
 function vercel_entry_default(req, res) {
   return handle(req, res);
 }
