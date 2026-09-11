@@ -25,22 +25,40 @@ const DIR = path.resolve(process.cwd(), "data");
 const FILE = path.join(DIR, "catalog.json");
 
 let cache: Map<string, Listing> | null = null;
+// Re-read when the file changes underneath us. Scripts (publish-offers.ts) write
+// the same catalog while the server is running, and a server holding a snapshot
+// from before they ran would serve an empty shop until it was restarted.
+let cachedMtimeMs = -1;
+
+function mtime(): number {
+  try {
+    return fs.statSync(FILE).mtimeMs;
+  } catch {
+    return -1; // no file yet
+  }
+}
 
 function load(): Map<string, Listing> {
-  if (cache) return cache;
+  const m = mtime();
+  if (cache && m === cachedMtimeMs) return cache;
   cache = new Map();
+  cachedMtimeMs = m;
   try {
     const raw = JSON.parse(fs.readFileSync(FILE, "utf-8"));
     for (const l of raw.listings ?? []) cache.set(l.policy.id, l);
   } catch {
-    /* no catalog yet */
+    /* no catalog yet, or it is being rewritten right now */
   }
   return cache;
 }
 
 function save(): void {
   fs.mkdirSync(DIR, { recursive: true });
-  fs.writeFileSync(FILE, JSON.stringify({ listings: [...load().values()] }, null, 2));
+  // Write-then-rename so a concurrent reader never sees a half-written file.
+  const tmp = FILE + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify({ listings: [...load().values()] }, null, 2));
+  fs.renameSync(tmp, FILE);
+  cachedMtimeMs = mtime();
 }
 
 export function list(): Listing[] {

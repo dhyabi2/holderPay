@@ -8,7 +8,11 @@
     "dev": "node --experimental-strip-types server/index.ts",
     "build:web": "node scripts/build-web.mjs",
     "keys": "node --experimental-strip-types scripts/keys.ts",
+    "balance": "node --experimental-strip-types scripts/balance.ts",
     "launch": "node --experimental-strip-types scripts/launch-token.ts",
+    "offers": "node --experimental-strip-types scripts/publish-offers.ts",
+    "verify": "node --experimental-strip-types scripts/verify.ts",
+    "await-funding": "node --experimental-strip-types scripts/await-funding.ts",
     "e2e": "node --experimental-strip-types scripts/e2e.ts",
     "test": "node --experimental-strip-types --test core/*.test.ts"
   },
