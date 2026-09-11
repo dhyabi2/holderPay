@@ -40,9 +40,17 @@ import { watcher } from "./watch.ts";
 loadEnv();
 
 const PORT = Number(env("PORT", "8787"));
+// Loopback by default. Binding to the world is the single decision that turns
+// every "fine on my laptop" setting into a public one, so it must be typed out
+// on purpose (HOST=0.0.0.0) rather than inherited by accident.
+const HOST = env("HOST", "127.0.0.1");
 const WEB = path.resolve(process.cwd(), "web");
 const TOKEN_ID = env("TEACHER_TOKEN_ID");
 const MERCHANT = env("MERCHANT_ADDRESS");
+
+/** A bind that only this machine can reach. */
+const isLoopback = (h: string) => h === "127.0.0.1" || h === "::1" || h === "localhost";
+const PUBLIC_BIND = !isLoopback(HOST);
 
 // ── RPC proxy ───────────────────────────────────────────────────────────────
 // The browser needs the ledger but must never see the API key. Only these
@@ -87,6 +95,12 @@ const WORK_PER_IP_PER_MIN = 12;
 const WORK_GLOBAL_PER_MIN = 120;
 const WORK_MAX_WAIT_MS = 75_000;
 const WORK_MAX_WAITERS = 64;
+
+// Ledger reads are cheap per call and ruinous in aggregate: ~145 of them per
+// replay means twenty simultaneous strangers checking a receipt is already 2900
+// calls a minute against one paid endpoint. The per-IP limit cannot see that,
+// because each of them is behaving. This ceiling can.
+const READ_GLOBAL_PER_MIN = Number(env("READ_GLOBAL_PER_MIN", "3000"));
 
 interface Budget {
   n: number;
@@ -182,6 +196,51 @@ function rateLimit(key: string, max: number, windowMs: number): boolean {
 // explicitly asks for dev mode.
 const ADMIN_TOKEN = env("ADMIN_TOKEN");
 const DEV_OPEN_CATALOG = env("HOLDERPAY_DEV") === "1";
+const ALLOW_FORGE = env("HOLDERPAY_ALLOW_FORGE") === "1";
+
+/**
+ * Refuse to serve the world in a configuration that is only safe on a laptop.
+ *
+ * Every setting below is harmless on loopback and dangerous off it, which is
+ * exactly the combination that ships by accident: the operator demos locally,
+ * deploys the same .env, and the demo switches stay on. A warning would be read
+ * once and forgotten, so this exits instead. Nothing here is a judgement call --
+ * each item is a setting that hands a stranger something they must not have.
+ */
+function refusePublicIfUnsafe(): void {
+  if (!PUBLIC_BIND) return;
+  const fatal: string[] = [];
+
+  if (DEV_OPEN_CATALOG) {
+    fatal.push(
+      "HOLDERPAY_DEV=1 leaves POST /api/policies open to anyone -- a stranger could publish offers into your shop, or rewrite what an existing offer hands over. Set ADMIN_TOKEN instead."
+    );
+  }
+  if (ALLOW_FORGE || DEV_OPEN_CATALOG) {
+    fatal.push(
+      "the forge demo (POST /api/verify?forge=1) is enabled -- it returns a GRANTED verdict for a payment that never happened. It is a teaching tool for localhost, never a public route."
+    );
+  }
+  if (ADMIN_TOKEN && Buffer.byteLength(ADMIN_TOKEN) < 24) {
+    fatal.push(`ADMIN_TOKEN is only ${Buffer.byteLength(ADMIN_TOKEN)} bytes -- use at least 24 (node -e "console.log(crypto.randomBytes(32).toString('hex'))"). A guessable admin token is worse than none, because none means closed.`);
+  }
+  if (!env("NANO_RPC_KEY")) {
+    fatal.push(
+      "NANO_RPC_KEY is missing -- proof of work is only ever fetched with the key (core/rpc.ts), so every payment would fail at the first block."
+    );
+  }
+
+  if (fatal.length) {
+    console.error(`\nholderPay refuses to bind ${HOST}:${PORT} in this configuration:\n`);
+    for (const f of fatal) console.error("  x " + f + "\n");
+    console.error("Fix these, or bind to 127.0.0.1 where they are safe.\n");
+    process.exit(1);
+  }
+
+  if (!ADMIN_TOKEN) {
+    console.log("  catalog   CLOSED (no ADMIN_TOKEN) -- publish with scripts/publish-offers.ts, which writes the file directly");
+  }
+}
 
 function adminOk(req: http.IncomingMessage): boolean {
   if (!ADMIN_TOKEN) return DEV_OPEN_CATALOG;
@@ -194,21 +253,76 @@ function adminOk(req: http.IncomingMessage): boolean {
 }
 
 // ── challenges (for proving control of the paying account) ───────────────────
-// Short-lived nonces. A challenge is not an authorisation: it only stops a
-// replay of someone else's signature. Losing this map logs people out; it can
-// never let anyone in.
-const challenges = new Map<string, number>();
+// A challenge is not an authorisation: it only stops a replay of someone else's
+// signature. It can never let anyone in, so losing one is an inconvenience, not
+// a breach -- but losing ALL of them mid-checkout is a user watching a real
+// payment be refused, which is the same thing as broken.
+//
+// They used to be rows in a Map, which meant a restart logged everybody out and
+// a second instance rejected challenges its neighbour had issued. So a challenge
+// is now SELF-DESCRIBING: expiry and nonce, signed with an HMAC this server
+// holds. Validity is recomputed, never looked up, so it survives a restart and
+// holds across instances that share the secret.
 const CHALLENGE_TTL_MS = 10 * 60_000;
 
-function newChallenge(): string {
-  const c = crypto.randomBytes(16).toString("hex");
-  challenges.set(c, Date.now() + CHALLENGE_TTL_MS);
-  for (const [k, exp] of challenges) if (exp < Date.now()) challenges.delete(k);
-  return c;
+// Shared across instances when set. Generated per process otherwise, which is
+// correct for one box: challenges simply stop being valid after a restart, the
+// behaviour we already had.
+const CHALLENGE_SECRET = (() => {
+  const s = env("CHALLENGE_SECRET");
+  if (s) return Buffer.from(s);
+  if (PUBLIC_BIND) {
+    console.log("  challenge no CHALLENGE_SECRET -- generating one; set it if you run more than one instance");
+  }
+  return crypto.randomBytes(32);
+})();
+
+function signChallenge(payload: string): string {
+  return crypto.createHmac("sha256", CHALLENGE_SECRET).update(payload).digest("hex").slice(0, 32);
 }
+
+function newChallenge(): string {
+  const payload = `${Date.now() + CHALLENGE_TTL_MS}.${crypto.randomBytes(16).toString("hex")}`;
+  return `${payload}.${signChallenge(payload)}`;
+}
+
+/**
+ * One-shot enforcement is the one part that cannot be stateless: proving a
+ * challenge has not been used before requires remembering that it was. This set
+ * holds only spent challenges, and only until they would expire anyway, so it
+ * stays small and loses nothing important on a restart -- an expired challenge
+ * is refused by its own signature regardless.
+ *
+ * Being honest about the limit: across several instances that do not share this
+ * set, a captured (challenge, signature) pair could be replayed once per
+ * instance inside its ten-minute life. That is strictly better than the old Map,
+ * where the pair was refused by every instance except the one that issued it --
+ * including the honest payer's own retry.
+ */
+const spent = new Set<string>();
+
 function challengeValid(c: string): boolean {
-  const exp = challenges.get(c);
-  return !!exp && exp > Date.now();
+  const parts = c.split(".");
+  if (parts.length !== 3) return false;
+  const [expStr, nonce, mac] = parts;
+  const exp = Number(expStr);
+  if (!Number.isFinite(exp) || exp < Date.now()) return false;
+  if (!/^[0-9a-f]{32}$/.test(nonce) || !/^[0-9a-f]{32}$/.test(mac)) return false;
+
+  const expected = signChallenge(`${expStr}.${nonce}`);
+  const a = Buffer.from(mac);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+  return !spent.has(c);
+}
+
+/** Burn a challenge after a successful use. */
+function spendChallenge(c: string): void {
+  spent.add(c);
+  if (spent.size > 10_000) {
+    const now = Date.now();
+    for (const k of spent) if (Number(k.split(".")[0]) < now) spent.delete(k);
+  }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -274,10 +388,21 @@ function tokenLabels(): TokenLabels {
 
 // ── the server ──────────────────────────────────────────────────────────────
 
+// In-flight bookkeeping, for draining on shutdown (see the bottom of the file).
+let inFlight = 0;
+let draining = false;
+let drained: (() => void) | null = null;
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   const ip = String(req.socket.remoteAddress ?? "?");
   const route = `${req.method} ${url.pathname}`;
+  harden(res);
+  inFlight++;
+  res.on("close", () => {
+    inFlight--;
+    if (draining && inFlight === 0) drained?.();
+  });
 
   try {
     // ---- static ----------------------------------------------------------
@@ -314,7 +439,22 @@ const server = http.createServer(async (req, res) => {
 
     // ---- rpc proxy --------------------------------------------------------
     if (route === "POST /api/rpc") {
-      if (!rateLimit(`rpc:${ip}`, 600, 60_000)) return json(res, 429, { error: "slow down" });
+      // MEASURED, do not lower blindly: one ledger replay costs ~145 calls
+      // (121 account_info, 12 pending, 9 blocks_info, 4 account_history over 39
+      // accounts), and the page performs a full replay for its OWN verdict every
+      // time it checks a receipt. A per-IP cap below ~300/min therefore breaks
+      // the browser's independent verification -- the feature this project
+      // exists for -- so the per-IP figure stays generous and the GLOBAL ceiling
+      // is what bounds total quota burn when the callers are a botnet rather
+      // than a person.
+      if (!rateLimit(`rpc:${ip}`, 600, 60_000)) {
+        res.setHeader("retry-after", "60");
+        return json(res, 429, { error: "too many ledger reads from this address -- try again in a minute" });
+      }
+      if (!rateLimit("rpc:global", READ_GLOBAL_PER_MIN, 60_000)) {
+        res.setHeader("retry-after", "60");
+        return json(res, 429, { error: "this verifier is at its ledger-read ceiling right now -- try again in a minute" });
+      }
       const body = await readBody(req);
       const action = String(body?.action ?? "");
       if (!ALLOWED_ACTIONS.has(action)) return json(res, 400, { error: `action not allowed: ${action}` });
@@ -492,7 +632,7 @@ const server = http.createServer(async (req, res) => {
       // The honest-server tamper demo. A real attacker would not add a query
       // parameter -- they would just patch this handler. The page's independent
       // check catches both identically, which is exactly the claim being made.
-      if (url.searchParams.get("forge") === "1" && (DEV_OPEN_CATALOG || env("HOLDERPAY_ALLOW_FORGE") === "1")) {
+      if (url.searchParams.get("forge") === "1" && (DEV_OPEN_CATALOG || ALLOW_FORGE)) {
         const forged: Verdict = {
           ...verdict,
           granted: true,
@@ -533,7 +673,7 @@ const server = http.createServer(async (req, res) => {
           digest: authDigest(listing.policy.id, verdict.receipt!, challenge),
         });
       }
-      challenges.delete(challenge); // one-shot
+      spendChallenge(challenge); // one-shot
       return json(res, 200, { verdict, unlock: listing.unlock });
     }
 
@@ -556,9 +696,63 @@ const server = http.createServer(async (req, res) => {
 
     return json(res, 404, { error: "no such route", route });
   } catch (e: any) {
-    return json(res, 500, { error: e?.message ?? String(e) });
+    // The client gets a reference, the operator gets the detail. An unhandled
+    // error's message is written for whoever wrote the code -- file paths, env
+    // names, library internals -- and none of that is owed to a stranger.
+    // Deliberate messages are unaffected: every route above answers for itself,
+    // including the RPC proxy, which forwards the node's own words on purpose.
+    const ref = crypto.randomBytes(6).toString("hex");
+    console.error(`[${ref}] ${route} failed:`, e);
+    return json(res, 500, { error: "something went wrong on this server", ref });
   }
 });
+
+/**
+ * Content Security Policy for the page.
+ *
+ * This matters more here than on a normal site: the buyer's WALLET SEED lives in
+ * this origin's localStorage (web/app.ts, SEED_KEY). One injected script reads it
+ * and empties the wallet, with no payment and no signature required. So the
+ * policy is allow-nothing plus exactly what the page uses -- its own bundle, its
+ * own stylesheet, its own /api, and the Nano websocket.
+ *
+ * The page is built for this: web/index.html carries no inline script and no
+ * inline style, so 'unsafe-inline' is never needed and is never granted.
+ */
+function contentSecurityPolicy(): string {
+  // The websocket is configurable, so derive its origin rather than hardcoding
+  // one -- a policy that does not match the socket silently kills confirmations.
+  let wsOrigin = "";
+  try {
+    wsOrigin = new URL(NANO_WS).origin;
+  } catch {
+    /* malformed NANO_WS_URL: omit it and let the socket fail loudly instead */
+  }
+  return [
+    "default-src 'none'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "img-src 'self' data:",
+    "font-src 'self'",
+    `connect-src 'self'${wsOrigin ? " " + wsOrigin : ""}`,
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ].join("; ");
+}
+
+/** Headers every response carries, whatever it is. */
+function harden(res: http.ServerResponse): void {
+  res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("referrer-policy", "no-referrer");
+  res.setHeader("x-frame-options", "DENY");
+  res.setHeader("cross-origin-opener-policy", "same-origin");
+  res.setHeader("cross-origin-resource-policy", "same-origin");
+  res.setHeader("permissions-policy", "geolocation=(), microphone=(), camera=(), payment=()");
+  // Only meaningful over TLS, and harmless otherwise; a public deployment is
+  // expected to terminate HTTPS in front of this process.
+  if (PUBLIC_BIND) res.setHeader("strict-transport-security", "max-age=31536000");
+}
 
 function serveFile(res: http.ServerResponse, file: string, type: string) {
   fs.readFile(file, (err, data) => {
@@ -566,7 +760,11 @@ function serveFile(res: http.ServerResponse, file: string, type: string) {
       res.writeHead(404, { "content-type": "text/plain" });
       return res.end("not found: " + path.basename(file));
     }
-    res.writeHead(200, { "content-type": type, "cache-control": "no-store" });
+    res.writeHead(200, {
+      "content-type": type,
+      "cache-control": "no-store",
+      "content-security-policy": contentSecurityPolicy(),
+    });
     res.end(data);
   });
 }
@@ -575,8 +773,52 @@ function serveFile(res: http.ServerResponse, file: string, type: string) {
 // payment made before anyone opens the page is still noticed immediately.
 watcher.watch([MERCHANT, ...catalog.list().map((l) => l.policy.merchant)].filter(Boolean));
 
-server.listen(PORT, () => {
-  console.log(`holderPay on http://localhost:${PORT}`);
+/**
+ * Drain rather than cut.
+ *
+ * A request here is not a page view: it can be the second half of a payment, and
+ * the work gate may legitimately hold one for over a minute waiting for a budget
+ * window. Killing that mid-flight leaves a buyer who has signed and broadcast a
+ * real block staring at a dead connection. So stop accepting new work, let what
+ * is in flight finish, and only then exit -- with a hard ceiling so a stuck
+ * request cannot keep a dying process alive forever.
+ */
+const SHUTDOWN_GRACE_MS = WORK_MAX_WAIT_MS + 15_000;
+
+function shutdown(signal: string): void {
+  if (draining) return; // a second Ctrl-C means "now", not "again"
+  draining = true;
+  console.log(`\n${signal} -- draining ${inFlight} request(s), up to ${Math.round(SHUTDOWN_GRACE_MS / 1000)}s`);
+  server.close(() => finish(0));
+  watcher.stop();
+
+  const timer = setTimeout(() => {
+    console.error(`still ${inFlight} request(s) in flight after the grace period -- exiting anyway`);
+    finish(1);
+  }, SHUTDOWN_GRACE_MS);
+  timer.unref();
+
+  drained = () => {
+    clearTimeout(timer);
+    finish(0);
+  };
+  if (inFlight === 0) drained();
+}
+
+let finished = false;
+function finish(code: number): void {
+  if (finished) return;
+  finished = true;
+  process.exit(code);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+refusePublicIfUnsafe();
+
+server.listen(PORT, HOST, () => {
+  console.log(`holderPay on http://${isLoopback(HOST) ? "localhost" : HOST}:${PORT}`);
   console.log(`  rpc       ${env("NANO_RPC_URL", "https://rpc.nano.to")} (key ${env("NANO_RPC_KEY") ? "loaded" : "MISSING"})`);
   console.log(`  websocket ${NANO_WS}`);
   console.log(`  token     ${TOKEN_ID || "(not launched yet -- run scripts/launch-token.ts)"}`);
