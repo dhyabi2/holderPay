@@ -55,7 +55,7 @@ npm run dev                   # http://localhost:8787
 Tests:
 
 ```bash
-npm test                      # 21 offline tests: one per security claim
+npm test                      # 47 offline tests: one per security claim
 npm run e2e                   # the same attacks on mainnet, micro amounts
 ```
 
