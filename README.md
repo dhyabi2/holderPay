@@ -34,9 +34,19 @@ rule welds them together; the buyer's own signature is the only thing that can
 produce either. There is no signing key on the server, no session to mint, and
 no "has paid" table — so there is nothing to tamper with.
 
-The page proves this to you rather than asserting it: press **run the tamper
-test** and the server will deliberately return a forged grant. The page catches
-it and refuses.
+The page proves this to you rather than asserting it: press **tamper test** and
+the server will deliberately return a forged grant. The page catches it and
+refuses.
+
+That demo route is **off unless you switch it on**, because a route that returns
+`granted: true` for a payment that never happened must not exist on a public
+URL. Run it on localhost with `HOLDERPAY_ALLOW_FORGE=1` in your `.env`
+(`.env.example` leaves it empty, so a fresh checkout has it off and the button
+has nothing to catch). The server refuses to bind a public address at all while
+the flag is set, and a Vercel deployment forces it off
+(`server/vercel-env.ts`) — so on the hosted page the button returns the honest
+verdict. What the page checks is not a demo switch: it re-derives every verdict
+from the ledger on every payment, forged or not.
 
 Full argument, including what is *not* claimed: **[docs/SECURITY.md](docs/SECURITY.md)**.
 

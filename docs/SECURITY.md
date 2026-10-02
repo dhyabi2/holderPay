@@ -130,13 +130,27 @@ token ledger, and compares its own verdict with the server's field by field. If
 the server claims a grant the ledger does not support, the page says so in red
 and refuses it locally.
 
-You can watch this happen. The **tamper test** button calls
+You can watch this happen on localhost. The **tamper test** button calls
 `POST /api/verify?forge=1`, a route that deliberately returns
 `granted: true` for a receipt that does not verify:
 
 ```
 the server claimed a grant the ledger does not support — refused
 ```
+
+The route only exists when `HOLDERPAY_ALLOW_FORGE=1` (or `HOLDERPAY_DEV=1`) is
+set, and `.env.example` leaves both empty: a route that grants access for a
+payment that never happened is a teaching tool, not something to leave reachable.
+`refusePublicIfUnsafe()` (`server/index.ts:215`) exits rather than bind a public
+address while either flag is set, and `server/vercel-env.ts` forces both to `0`
+before the server is imported, so the hosted page cannot reach it. Without the
+flag the query parameter is ignored and `/api/verify` answers with the honest
+verdict, which the page then agrees with — nothing is refused, because nothing
+was forged.
+
+None of that is what the claim rests on. The page's own verdict is derived from
+the ledger on every single payment, with or without the flag; the forge route
+only lets you watch it disagree on demand.
 
 A real attacker would not add a query parameter — they would patch the handler.
 The page's independent check catches both identically, which is the whole point
