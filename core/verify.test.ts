@@ -9,7 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as nanocurrency from "nanocurrency";
 
-import { makePolicy, acceptedToken, type Policy } from "./policy.ts";
+import { makePolicy, acceptedToken, policyIsIntact, type Policy } from "./policy.ts";
 import { memoLink, signAuth, verifyAuth, grantId, RECEIPT_MARKER } from "./proof.ts";
 import { verifyPayment } from "./verify.ts";
 import type { ChainReader, VerifiedBlock } from "./block.ts";
@@ -425,4 +425,19 @@ test("the policy id does not depend on key order", () => {
     description: "d", title: "t", resource: "r", merchant: MERCHANT,
   });
   assert.equal(a.id, b.id);
+});
+
+test("a price that is not an integer denies instead of throwing", async () => {
+  // `priceXno` is raw, but "0.0001" is how a human writes a price, and nothing
+  // in `makePolicy`/`policyId` rejects it: the offer hashes to a valid id and
+  // `policyIsIntact` says yes. The throw then happened inside `xnoLane`, AFTER
+  // the destination check -- so it only fired once a buyer had really sent XNO
+  // to the merchant, turning a paid call into a 500 that no retry could clear.
+  const r = new MemoryReader();
+  const policy = xnoPolicy({ priceXno: "0.0001" });
+  assert.equal(policyIsIntact(policy), true, "a decimal price still hashes to a valid id");
+  const { receipt } = payXno(r, policy, XNO / 10_000n);
+  const v = await verifyPayment(policy, receipt.hash, r);
+  assert.equal(v.granted, false);
+  assert.equal(v.reason, "this offer does not accept XNO");
 });

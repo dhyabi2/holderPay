@@ -250,8 +250,25 @@ export function swapTarget(p: PolicyInput & { v?: 1 | 2 }): AcceptedToken | null
   return list.find((a) => a.tokenId === want) ?? list[0];
 }
 
+/**
+ * Drop an unusable `priceXno` rather than throw, the same way
+ * `normalizeAcceptAny` drops an unusable `acceptAny`.
+ *
+ * `priceXno` is raw, but "0.0001" is how a human writes a price and nothing
+ * rejects it: `policyId` hashes the string as given, so such an offer is
+ * published with an intact id. `priceXnoOf` is then called from `xnoLane`
+ * AFTER the destination check -- only once the payment really is XNO to this
+ * merchant -- so an unparseable price threw out of `verifyPayment` exactly
+ * when a buyer had paid, and no retry could clear it. `xnoLane` already has a
+ * verdict for "no XNO price"; returning false reaches it.
+ */
 export function acceptsXno(p: PolicyInput): boolean {
-  return !!p.priceXno && BigInt(p.priceXno) > 0n;
+  if (!p.priceXno) return false;
+  try {
+    return BigInt(p.priceXno) > 0n;
+  } catch {
+    return false;
+  }
 }
 
 export function acceptsToken(p: PolicyInput & { v?: 1 | 2 }): boolean {
