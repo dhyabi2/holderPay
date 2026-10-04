@@ -87,6 +87,17 @@ await esbuild.build({
 });
 
 // ── the page ─────────────────────────────────────────────────────────────────
+// BUILT here, not copied. `web/pay.js` is a committed artefact, so copying it
+// deploys whatever happens to be in the tree: a change to core/ that nobody
+// rebuilt the page for ships the OLD verdict code to the browser while the
+// function carries the new one. That happened - the `acceptsXno` fix of #3,
+// which stops verification throwing after a buyer has paid, was in core/ and
+// not in the bundle for a day, and this script would have copied the crashing
+// page to production again. esbuild is deterministic, so for a tree whose
+// bundle is already current this rewrites the same bytes and the deployment is
+// unchanged; when it is not current, the fix ships instead of being lost.
+await import(path.join(ROOT, "scripts", "build-web.mjs"));
+
 const pub = p("public");
 fs.rmSync(pub, { recursive: true, force: true });
 fs.mkdirSync(pub, { recursive: true });
