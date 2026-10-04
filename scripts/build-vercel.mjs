@@ -30,13 +30,47 @@ const p = (...x) => path.join(ROOT, ...x);
 // build. An offer carries the hash of its own contents, so a baked offer cannot
 // be quietly altered in transit: the id would stop matching.
 const catalogSrc = p("data", "catalog.json");
-let catalog = { listings: [] };
+const bakedCatalog = p("server", "catalog.baked.json");
+let catalog = null;
 try {
   catalog = JSON.parse(fs.readFileSync(catalogSrc, "utf-8"));
 } catch {
-  console.warn("! no data/catalog.json -- deploying an empty shop");
+  catalog = null;
 }
-fs.writeFileSync(p("server", "catalog.baked.json"), JSON.stringify(catalog, null, 2));
+// REFUSE rather than warn when this would replace a shop with no shop.
+//
+// `data/` is in .gitignore, so data/catalog.json exists only on the machine that
+// created the offers. Every other checkout - a fresh clone, CI, a second laptop -
+// reads nothing, and this used to warn "deploying an empty shop" and then write
+// {"listings": []} straight over the committed server/catalog.baked.json. Measured
+// on 2026-10-04: one `npm run build:vercel` in a fresh clone turned 3 baked offers
+// into 0. Deploy that and the shop has no offers at all, so nobody can pay in XNO -
+// and a line of warning output is the wrong shape for that, because it scrolls past
+// in a build log and nothing else says anything is wrong.
+//
+// An empty shop is still buildable when that is what is meant: there is nothing to
+// lose when no catalogue is baked yet, and `--allow-empty-shop` says it on purpose.
+const baked = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(bakedCatalog, "utf-8"));
+  } catch {
+    return null;
+  }
+})();
+const wouldEmpty = !catalog?.listings?.length && baked?.listings?.length;
+if (wouldEmpty && !process.argv.includes("--allow-empty-shop")) {
+  console.error(
+    `\nREFUSING THE BUILD: no data/catalog.json, and server/catalog.baked.json already carries ` +
+      `${baked.listings.length} listing(s).\nBaking an empty shop over them deploys a shop nobody can ` +
+      `pay into. Build where data/catalog.json is, or pass --allow-empty-shop if an empty shop is meant.`
+  );
+  process.exit(1);
+}
+if (!catalog) {
+  console.warn("! no data/catalog.json -- deploying an empty shop");
+  catalog = { listings: [] };
+}
+fs.writeFileSync(bakedCatalog, JSON.stringify(catalog, null, 2));
 
 // ── the token catalogue, baked in ────────────────────────────────────────────
 // Built offline by scripts/snapshot-tokens.ts, because folding every chain that
@@ -87,6 +121,17 @@ await esbuild.build({
 });
 
 // ── the page ─────────────────────────────────────────────────────────────────
+// BUILT here, not copied. `web/pay.js` is a committed artefact, so copying it
+// deploys whatever happens to be in the tree: a change to core/ that nobody
+// rebuilt the page for ships the OLD verdict code to the browser while the
+// function carries the new one. That happened - the `acceptsXno` fix of #3,
+// which stops verification throwing after a buyer has paid, was in core/ and
+// not in the bundle for a day, and this script would have copied the crashing
+// page to production again. esbuild is deterministic, so for a tree whose
+// bundle is already current this rewrites the same bytes and the deployment is
+// unchanged; when it is not current, the fix ships instead of being lost.
+await import(path.join(ROOT, "scripts", "build-web.mjs"));
+
 const pub = p("public");
 fs.rmSync(pub, { recursive: true, force: true });
 fs.mkdirSync(pub, { recursive: true });
