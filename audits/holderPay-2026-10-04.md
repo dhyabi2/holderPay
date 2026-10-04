@@ -63,29 +63,41 @@ here: one `npm run build:vercel` in a fresh clone turned 3 baked offers into 0, 
 rather than a refusal. Deploy that and the shop has no offers at all, so nobody can pay in XNO.
 A warning that reads like a note is the wrong shape for replacing a live catalogue with nothing.
 
-## Fixed
+## Fixed, and split in two on purpose
 
-On `fix/the-page-ships-a-stale-bundle`:
+**Finding 1 — `fix/rebuild-the-page-bundle` (this branch).** `web/pay.js`, `web/pay.js.map` and
+`public/pay.js` rebuilt, so the page carries #3's fix (`sha256 51c0b50f…`, and the guarded
+`acceptsXno` is in `public/pay.js`). Nothing else: no `.ts`, no script. `npm run build:web` in a
+clean clone of the branch leaves the tree **unchanged**, which is the proof that the committed
+artefact is now what the source produces. `npm test` 48 pass. This is the half that stops the live
+page crashing, and it touches no deploy script, so a routine may merge it.
 
-- `web/pay.js`, `web/pay.js.map` and `public/pay.js` rebuilt, so the page carries #3's fix
-  (`sha256 51c0b50f…`, and the guarded `acceptsXno` is in `public/pay.js`).
-- `build-vercel.mjs` now **builds** the page (`await import("scripts/build-web.mjs")`) before
-  copying it, so the class of defect is gone rather than this one instance of it. esbuild is
-  deterministic: on a tree whose bundle is already current this rewrites the same bytes and the
-  deployment is unchanged. `build-web.mjs`'s own key-leak refusal therefore also now runs on every
-  deploy, which it did not before.
+**Findings 2 and 3 — `fix/deploy-builds-the-page-and-keeps-the-shop`, left open for the owner.**
+Both are in `scripts/build-vercel.mjs`, which is the deploy build. The merge rule here holds back a
+change to a release path whatever its content, and rightly: a mistake in this file is deployed
+rather than caught by a test. So it is proposed, not merged:
 
-Evidence, with `web/pay.js` reverted to the stale committed version both times:
+- the page is **built** (`await import("scripts/build-web.mjs")`) before being copied, so finding 1
+  cannot recur. esbuild is deterministic: on a tree whose bundle is already current this rewrites
+  the same bytes and the deployment is unchanged. `build-web.mjs`'s own key-leak refusal then also
+  runs on every deploy, which it does not today;
+- the empty-shop warning becomes a **refusal**, in the one case that loses something: no catalogue
+  to read AND a baked one that already carries listings. Measured there — refuses with exit 1 and
+  writes nothing; `--allow-empty-shop` proceeds; a real `data/catalog.json` bakes its 3 listings.
+
+Evidence for the first, with `web/pay.js` reverted to the stale committed version both times:
 
 | build script | `public/pay.js` carries #3's fix | carries the crashing line |
 |---|---|---|
 | `main`'s | no | **yes** |
-| this branch's | **yes** | no |
+| the proposed one | **yes** | no |
 
-`npm test` 48 pass either way — the suite covers `core/`, and no test could have caught this,
-because the defect is that an artefact was not rebuilt. The table above is the test that holds.
+`npm test` 48 pass either way — the suite covers `core/`, and **no test could have caught finding
+1**, because the defect is that an artefact was not rebuilt. The table above is the test that holds.
 
-Finding 3 is a separate concern and is not in this branch.
+`server/tokens.baked.json` takes the same empty-overwrite path as the catalogue and is deliberately
+left alone: its own comment says it is DISPLAY ONLY and that a missing snapshot is not an error, so
+emptying it loses nothing anybody pays with.
 
 ## Could not verify
 
