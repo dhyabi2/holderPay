@@ -104,7 +104,26 @@ emptying it loses nothing anybody pays with.
 - **Still no browser.** This establishes that the shipped bundle now contains the same
   `acceptsXno` as `core/policy.ts`, by rebuilding and comparing. It does not execute the page.
 - **The live deployment was not reached** (outbound HTTPS is proxied here), so whether production
-  is currently serving the stale bundle is read off the committed `public/pay.js`, which is what
-  `build-vercel.mjs` uploads.
+  is currently serving the stale bundle is read off the committed `public/pay.js`.
+
+  **Answered after the fact, and it makes finding 1 worse than written above.** The platform runs
+  no build of its own: `package.json` has no `build` script, `vercel.json` carries no
+  `buildCommand`, and `.vercelignore` excludes `scripts/` along with every source directory, so
+  what is uploaded is exactly the committed `api/[...path].js` and `public/`. There is therefore no
+  step on the platform that could have corrected the stale bundle, and nothing to notice it: the
+  committed artefact **is** the deployment, continuously, from whenever it went stale until #5
+  merged — not "would have been on the next deploy".
+
+  The same fact cuts the other way for finding 2's fix, and is worth knowing before merging it:
+  because `build:vercel` never runs on the platform, the new refusal cannot break a deploy. It is
+  why #6's preview deployment read `Ready` with the refusal in place. So "a mistake in this file is
+  deployed rather than caught by a test" is too strong — a mistake here is caught the next time a
+  person runs it. What the script produces is still what gets deployed, with no second check behind
+  it, so the care is warranted; the blast radius is not immediate.
+
+- **Verified on the merged tree once #5 landed:** a full `node scripts/build-vercel.mjs` with a real
+  `data/catalog.json` present leaves `web/pay.js`, `public/pay.js` and `web/pay.js.map`
+  byte-identical to `main`'s and bakes the 3 listings. That is #6's "the rebuild is a no-op" claim,
+  now measured against the real post-#5 `main` rather than argued from esbuild being deterministic.
 - `vendor/hodl/` was again read only where the token lane enters it.
 - `npm run e2e` moves real XNO and was not run.
