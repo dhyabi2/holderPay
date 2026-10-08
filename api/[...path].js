@@ -3313,7 +3313,12 @@ function swapTarget(p) {
   return list2.find((a) => a.tokenId === want) ?? list2[0];
 }
 function acceptsXno(p) {
-  return !!p.priceXno && BigInt(p.priceXno) > 0n;
+  if (!p.priceXno) return false;
+  try {
+    return BigInt(p.priceXno) > 0n;
+  } catch {
+    return false;
+  }
 }
 function acceptsToken(p) {
   return acceptedTokens(p).length > 0 || acceptAnyOf(p) !== null;
