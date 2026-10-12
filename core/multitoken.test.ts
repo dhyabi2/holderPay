@@ -20,12 +20,13 @@ import {
   policyIsIntact,
   acceptedTokens,
   acceptedToken,
+  acceptsToken,
   swapTarget,
   normalizeAccept,
   type Policy,
 } from "./policy.ts";
 import { memoLink } from "./proof.ts";
-import { verifyPayment } from "./verify.ts";
+import { verifyPayment, lanesOf } from "./verify.ts";
 import { tokenList, sortTokens, viewToken, backingOf, circulatingOf, quotedPriceOf } from "./valuation.ts";
 import type { ChainReader, VerifiedBlock } from "./block.ts";
 
@@ -590,4 +591,93 @@ test("an offer with a listed price ignores collateral for that token", async () 
 
   assert.equal(v.granted, true, "the merchant's own listed price wins for a listed token");
   assert.equal(v.price, (10n * UNIT).toString());
+});
+
+// ── a v1 price that is not an integer ───────────────────────────────────────
+//
+// `priceXno` already has this fixed: core/policy.ts's `acceptsXno` wraps
+// `BigInt` in a try/catch because "0.0001" is how a human writes a price, the
+// policy id hashes the string as given, and the bare conversion threw out of
+// `verifyPayment` after a buyer had paid. v1's `priceToken` is the same field
+// on the token lane and had the same bare conversion.
+//
+// v1's hashable shape is frozen -- its receipts are on chain -- so unlike v2
+// there is no `normalizeAccept` screening the list before it is hashed. A v1
+// offer whose price reads "0.5" therefore publishes with an INTACT id, and the
+// throw lands in three places that matter: `acceptsToken` (which `tokenLane`
+// calls after the fragment pair has already decoded, i.e. after the money
+// moved), `lanesOf` (the page's and the shop's lane display), and
+// `GET /api/policies`, which maps `acceptedTokens` over every listing.
+
+function v1WithPrice(priceToken: string): Policy {
+  return makePolicy({
+    v: 1,
+    merchant: merchant.address,
+    resource: "r", title: "t", description: "d",
+    token: { tokenId: "a".repeat(32), symbol: "AAA", decimals: DEC },
+    priceToken,
+    autoswap: false,
+    expires: 0,
+  });
+}
+
+test("a v1 price that is not an integer is dropped, not thrown on", () => {
+  // Each of these publishes with an intact id and used to raise SyntaxError out
+  // of every accessor. "0.5" and "1e6" are the realistic ones: a price written
+  // in display units, and one written in exponent notation.
+  // ("0x10" is NOT in this list: `BigInt` reads it as 16, so it is a price.)
+  for (const priceToken of ["0.5", "1e6", "1,000", "abc", "-5", ""]) {
+    const p = v1WithPrice(priceToken);
+    assert.equal(policyIsIntact(p), true, priceToken);
+    assert.deepEqual(acceptedTokens(p), [], priceToken);
+    assert.equal(acceptsToken(p), false, priceToken);
+    assert.deepEqual(lanesOf(p), [], priceToken);
+  }
+  // A v1 offer with a missing or non-string token id threw from the same line,
+  // and is now read as the empty id (which matches nothing). Such a policy
+  // cannot be built by `makePolicy` at all -- `hashableV1` throws on it first,
+  // which is a separate defect left for the owner -- so it is constructed here
+  // the only way it can actually arrive: as an inline policy in a request body.
+  const noId = { ...v1WithPrice("1000000"), token: { symbol: "AAA", decimals: DEC } } as any;
+  assert.deepEqual(acceptedTokens(noId), [
+    { tokenId: "", symbol: "AAA", decimals: DEC, price: "1000000" },
+  ]);
+  assert.equal(acceptedToken(noId, "a".repeat(32)), null, "the empty id matches nothing");
+});
+
+test("an integer v1 price is still accepted, unchanged", () => {
+  const p = v1WithPrice("1000000");
+  assert.equal(acceptedTokens(p).length, 1);
+  assert.equal(acceptedToken(p, "a".repeat(32))!.price, "1000000");
+  assert.deepEqual(lanesOf(p), ["TOKEN"]);
+});
+
+test("a v1 offer priced '0.5' denies the buyer instead of throwing after they paid", async () => {
+  const sim = new Sim();
+  sim.open(alice, XNO);
+  sim.open(merchant, 0n);
+  sim.open(buyer, XNO / 100n);
+  const tokenId = launch(sim, alice, "HONEST", 1_000_000n, XNO / 100n, 100_000n);
+
+  // The offer as a v1 merchant wrote it: 0.5 of a 6-decimal token.
+  const policy = makePolicy({
+    v: 1,
+    merchant: merchant.address,
+    resource: "r", title: "t", description: "d",
+    token: { tokenId, symbol: "HONEST", decimals: DEC },
+    priceToken: "0.5",
+    autoswap: false,
+    expires: 0,
+  });
+  assert.equal(policyIsIntact(policy), true, "it publishes with an intact id");
+
+  // The buyer really pays: a buy, a transfer to the merchant, and the receipt
+  // chained onto it. By the time the verdict is computed the money has moved.
+  const receipt = buyAndPay(sim, tokenId, 1n * UNIT, XNO / 1000n, policy);
+  const reader = readerFor(sim, [alice.address, merchant.address, buyer.address]);
+
+  const verdict = await verifyPayment(policy, receipt.hash, reader);
+  assert.equal(verdict.granted, false);
+  assert.equal(verdict.reason, "this offer does not accept tokens");
+  assert.equal(verdict.payer, buyer.address, "the verdict still reports who paid");
 });

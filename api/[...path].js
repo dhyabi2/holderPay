@@ -3290,10 +3290,17 @@ function policyIsIntact(p) {
 }
 function acceptedTokens(p) {
   if ((p.v ?? 2) === 1) {
-    if (!p.token || !p.priceToken || BigInt(p.priceToken) <= 0n) return [];
+    if (!p.token || !p.priceToken) return [];
+    let price;
+    try {
+      price = BigInt(p.priceToken);
+    } catch {
+      return [];
+    }
+    if (price <= 0n) return [];
     return [
       {
-        tokenId: p.token.tokenId.toLowerCase(),
+        tokenId: String(p.token.tokenId ?? "").toLowerCase(),
         symbol: p.token.symbol,
         decimals: p.token.decimals,
         price: p.priceToken

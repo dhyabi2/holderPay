@@ -223,10 +223,34 @@ export function policyIsIntact(p: Policy): boolean {
  */
 export function acceptedTokens(p: PolicyInput & { v?: 1 | 2 }): AcceptedToken[] {
   if ((p.v ?? 2) === 1) {
-    if (!p.token || !p.priceToken || BigInt(p.priceToken) <= 0n) return [];
+    if (!p.token || !p.priceToken) return [];
+    // Drop an unusable v1 price rather than throw -- the same reason, and the
+    // same remedy, as `acceptsXno` below.
+    //
+    // `priceToken` is the token's smallest unit, but "0.5" is how a human writes
+    // a price and nothing rejected it: `hashableV1` hashes the string as given,
+    // so such an offer publishes with an INTACT id (v2's `normalizeAccept`
+    // screens its own list; v1 has no equivalent, and v1's shape is frozen
+    // because its receipts are already on chain). The bare `BigInt(p.priceToken)`
+    // then raised SyntaxError out of here -- and this function is reached from
+    // `acceptsToken`, which `tokenLane` calls AFTER the fragment pair has
+    // decoded, so it threw out of `verifyPayment` exactly when a buyer had paid
+    // and no retry could clear it. It is also reached from `lanesOf` and from
+    // `GET /api/policies`, so one such offer in the catalog took the whole shop
+    // listing down with it.
+    //
+    // `tokenId` is guarded for the same reason: v1 never checked its shape, and
+    // `.toLowerCase()` on a missing or non-string id threw from the same place.
+    let price: bigint;
+    try {
+      price = BigInt(p.priceToken);
+    } catch {
+      return [];
+    }
+    if (price <= 0n) return [];
     return [
       {
-        tokenId: p.token.tokenId.toLowerCase(),
+        tokenId: String(p.token.tokenId ?? "").toLowerCase(),
         symbol: p.token.symbol,
         decimals: p.token.decimals,
         price: p.priceToken,
