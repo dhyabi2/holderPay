@@ -54,27 +54,70 @@ export async function fold(extraAccounts: string[] = []): Promise<Fold> {
 // the websocket path, which invalidates on every relevant confirmation) from
 // hammering the endpoint. The TTL is deliberately short: a payment has to show
 // up quickly, and `bustFold` makes the common case immediate anyway.
-let cached: { fold: Fold; key: string } | null = null;
-let inflight: Promise<Fold> | null = null;
-const FOLD_TTL_MS = 4000;
-
-export async function currentFold(extraAccounts: string[] = [], force = false): Promise<Fold> {
-  const key = [...extraAccounts].sort().join(",");
-  if (!force && cached && cached.key === key && Date.now() - cached.fold.at < FOLD_TTL_MS) return cached.fold;
-  if (inflight) return inflight;
-  inflight = (async () => {
-    try {
-      const f = await fold(extraAccounts);
-      cached = { fold: f, key };
-      return f;
-    } finally {
-      inflight = null;
-    }
-  })();
-  return inflight;
+//
+// WHICH ACCOUNTS WERE FOLDED IS PART OF THE ANSWER, NOT AN OPTIMISATION.
+// `extraAccounts` is the buyer's own account, passed in from `body.payer` on
+// POST /api/verify and POST /api/access. core/fold.ts states the consequence of
+// leaving it out: "An account that traded this token without ever touching any
+// seed is invisible here, and its ops are missing from the fold ... it can cause
+// a real payment to fail verification". So a fold computed for one account set
+// does not answer another caller's question, and `cached` is keyed on the set
+// for exactly that reason. `inflight` was not: whoever arrived while any fold
+// was running got that fold, whatever accounts it covered. Two buyers checking
+// out within the same few seconds -- or one buyer's page polling while the
+// other's request runs -- was enough: the second got a replay with the first
+// buyer's seed and not their own, `opApplied` found no carrier for their
+// transfer, and `tokenLane` reported "not present in this verifier's replay
+// yet" for a confirmed token payment they had already made.
+interface Inflight {
+  key: string;
+  promise: Promise<Fold>;
 }
 
-/** Invalidate the cache -- called when the websocket sees a relevant block. */
+let cached: { fold: Fold; key: string } | null = null;
+let inflight: Inflight | null = null;
+// Bumped by `bustFold`. A fold that was already running when the websocket saw
+// a relevant block describes the ledger as it was BEFORE that block: it is
+// still returned to the caller that asked for it, but it must not become the
+// cached answer for the next one, or the bust buys nothing.
+let generation = 0;
+const FOLD_TTL_MS = 4000;
+
+export async function currentFold(
+  extraAccounts: string[] = [],
+  force = false,
+  // The replay itself, injectable so the cache's rules can be tested without a
+  // node: the same seam `foldAccounts(source, ...)` already uses one level down.
+  load: (accounts: string[]) => Promise<Fold> = fold
+): Promise<Fold> {
+  const key = [...extraAccounts].sort().join(",");
+  if (!force && cached && cached.key === key && Date.now() - cached.fold.at < FOLD_TTL_MS) return cached.fold;
+  // Coalesce with a fold that is already running ONLY when it covers the same
+  // accounts. Two different account sets now cost two replays, which is the
+  // price of each caller getting an answer to its own question.
+  if (!force && inflight && inflight.key === key) return inflight.promise;
+  const startedAt = generation;
+  const entry: Inflight = { key, promise: null as unknown as Promise<Fold> };
+  entry.promise = (async () => {
+    try {
+      const f = await load(extraAccounts);
+      if (startedAt === generation) cached = { fold: f, key };
+      return f;
+    } finally {
+      if (inflight === entry) inflight = null;
+    }
+  })();
+  inflight = entry;
+  return entry.promise;
+}
+
+/** Invalidate the cache -- called when the websocket sees a relevant block.
+ *
+ * The in-flight fold is dropped too. `scripts/e2e.ts` calls this for "a fresh
+ * replay each attempt: this is the real check, not a cache", and a `currentFold`
+ * that handed back a replay started before the bust was not a fresh one. */
 export function bustFold(): void {
   cached = null;
+  inflight = null;
+  generation += 1;
 }
