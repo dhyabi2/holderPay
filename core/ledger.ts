@@ -62,26 +62,60 @@ export async function fold(extraAccounts: string[] = []): Promise<Fold> {
 // seed is invisible here, and its ops are missing from the fold ... it can cause
 // a real payment to fail verification". So a fold computed for one account set
 // does not answer another caller's question, and `cached` is keyed on the set
-// for exactly that reason. `inflight` was not: whoever arrived while any fold
+// for exactly that reason. `inflight` once was not: whoever arrived while any fold
 // was running got that fold, whatever accounts it covered. Two buyers checking
 // out within the same few seconds -- or one buyer's page polling while the
 // other's request runs -- was enough: the second got a replay with the first
 // buyer's seed and not their own, `opApplied` found no carrier for their
 // transfer, and `tokenLane` reported "not present in this verifier's replay
 // yet" for a confirmed token payment they had already made.
+//
+// In-flight folds are kept in a Map keyed by the account set, so interleaved
+// callers for a, b, a cost two replays, not three. Distinct account sets each
+// need their own replay (about 145 RPC calls each), and GET /api/tokens and
+// /api/token are unauthenticated, so at most MAX_CONCURRENT_REPLAYS of them run
+// at once; the rest wait in arrival order for a slot. They are still entered in
+// the Map while they wait, so a second caller for a waiting set joins it rather
+// than queueing another replay. The cap bounds the RPC burst, not the queue.
 interface Inflight {
   key: string;
   promise: Promise<Fold>;
 }
 
-let cached: { fold: Fold; key: string } | null = null;
-let inflight: Inflight | null = null;
+export const MAX_CONCURRENT_REPLAYS = 4;
+
+let cached: { fold: Fold; key: string; seq: number } | null = null;
+const inflight = new Map<string, Inflight>();
 // Bumped by `bustFold`. A fold that was already running when the websocket saw
 // a relevant block describes the ledger as it was BEFORE that block: it is
 // still returned to the caller that asked for it, but it must not become the
 // cached answer for the next one, or the bust buys nothing.
 let generation = 0;
+// Stamped on each replay when it actually starts. A replay only becomes the
+// cached answer if no replay that started after it has already been cached, so
+// an older fold finishing last (two `force` calls, or a slow and a fast set)
+// cannot overwrite newer data.
+let replaySeq = 0;
 const FOLD_TTL_MS = 4000;
+
+let activeReplays = 0;
+const waiting: Array<() => void> = [];
+
+/** null when a slot was free and is now held; otherwise a promise that resolves
+ * once a finishing replay hands its slot over. */
+function acquireSlot(): Promise<void> | null {
+  if (activeReplays < MAX_CONCURRENT_REPLAYS) {
+    activeReplays += 1;
+    return null;
+  }
+  return new Promise<void>((resolve) => waiting.push(resolve));
+}
+
+function releaseSlot(): void {
+  const next = waiting.shift();
+  if (next) next();
+  else activeReplays -= 1;
+}
 
 export async function currentFold(
   extraAccounts: string[] = [],
@@ -92,22 +126,30 @@ export async function currentFold(
 ): Promise<Fold> {
   const key = [...extraAccounts].sort().join(",");
   if (!force && cached && cached.key === key && Date.now() - cached.fold.at < FOLD_TTL_MS) return cached.fold;
-  // Coalesce with a fold that is already running ONLY when it covers the same
-  // accounts. Two different account sets now cost two replays, which is the
-  // price of each caller getting an answer to its own question.
-  if (!force && inflight && inflight.key === key) return inflight.promise;
+  // Coalesce with a fold that is already running (or waiting for a slot) ONLY
+  // when it covers the same accounts.
+  const running = inflight.get(key);
+  if (!force && running) return running.promise;
   const startedAt = generation;
   const entry: Inflight = { key, promise: null as unknown as Promise<Fold> };
+  // In the Map before the replay starts, so its cleanup always finds it.
+  inflight.set(key, entry);
   entry.promise = (async () => {
     try {
-      const f = await load(extraAccounts);
-      if (startedAt === generation) cached = { fold: f, key };
-      return f;
+      const wait = acquireSlot();
+      if (wait) await wait;
+      try {
+        const seq = ++replaySeq;
+        const f = await load(extraAccounts);
+        if (startedAt === generation && !(cached && cached.seq > seq)) cached = { fold: f, key, seq };
+        return f;
+      } finally {
+        releaseSlot();
+      }
     } finally {
-      if (inflight === entry) inflight = null;
+      if (inflight.get(key) === entry) inflight.delete(key);
     }
   })();
-  inflight = entry;
   return entry.promise;
 }
 
@@ -118,6 +160,6 @@ export async function currentFold(
  * that handed back a replay started before the bust was not a fresh one. */
 export function bustFold(): void {
   cached = null;
-  inflight = null;
+  inflight.clear();
   generation += 1;
 }
