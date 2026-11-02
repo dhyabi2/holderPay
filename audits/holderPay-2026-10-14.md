@@ -11,8 +11,9 @@ $ npm ci && npm test                      # 51 passed, 0 failed
 $ node scripts/build-web.mjs              # rewrites web/pay.js byte-identically
 ```
 
-With this branch: **55 passed**, `build-web.mjs` still byte-identical (`core/ledger.ts`
-imports `node:fs` and is not in the browser bundle).
+With this branch: **59 passed**, `build-web.mjs` still byte-identical (`core/ledger.ts`
+imports `node:fs` and is not in the browser bundle). 55 of those came with the first commit;
+the follow-up below added four more.
 
 Every prior audit read the verdict as a *pure function* — policy, receipt, reader — and
 that reading is still sound. This run read the one input that function does not control:
@@ -130,6 +131,29 @@ $ node --experimental-strip-types --test core/ledger.test.ts   # with it
 # tests 4   # pass 4   # fail 0
 $ npm test                                                     # 55 passed, 0 failed
 ```
+
+### Follow-up on the same branch — `37d060f`, keyed by set rather than one slot
+
+The first commit held ONE in-flight entry, so interleaved callers for a, b, a started a
+third replay: the second `a` arrived after `b` had replaced it. `37d060f` keeps in-flight
+folds in a `Map` keyed by the account set, which costs two replays for that sequence rather
+than three, and adds two things the single slot had no room for:
+
+- **A cap of `MAX_CONCURRENT_REPLAYS` (4) distinct replays at once**, with the rest waiting
+  in arrival order and still joinable from the Map while they wait. Each replay is about 145
+  RPC calls and `GET /api/tokens` is unauthenticated, so this bounds the burst. It bounds the
+  burst and not the queue, which the comment there says plainly: distinct account sets come
+  from caller-supplied parameters, so `waiting` can still grow — one entry per distinct set,
+  which is strictly better than one unbounded 145-call replay per distinct set.
+- **A start stamp (`replaySeq`) on each replay**, so a fold that started earlier but finished
+  later cannot overwrite a newer cached one. Two `force` calls, or a slow set finishing after
+  a fast one, hit this.
+
+Re-verified here rather than assumed: `npm test` 59 passed / 0 failed, and
+`node scripts/build-web.mjs` leaves `web/pay.js` byte-identical. The baton-passing in
+`acquireSlot`/`releaseSlot` is sound — a finishing replay hands its slot to the next waiter
+without decrementing, so `activeReplays` stays equal to the slots actually held, and the
+release sits in a `finally` so a throwing `load` cannot leak one.
 
 ## Could not verify
 
