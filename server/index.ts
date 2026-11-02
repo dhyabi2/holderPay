@@ -30,7 +30,7 @@ import { verifyPayment, lanesOf, type Verdict } from "../core/verify.ts";
 import { memoLink, authDigest, verifyAuth, grantId } from "../core/proof.ts";
 import { addressToPub, isNanoAddress } from "../core/block.ts";
 import { NodeReader } from "../core/reader.ts";
-import { currentFold, stateOf } from "../core/ledger.ts";
+import { currentFold, stateOf, FoldBusyError } from "../core/ledger.ts";
 import { tokenList, viewToken, type SortKey, type TokenLabels } from "../core/valuation.ts";
 import { planSwap, quoteBuy } from "../core/swap.ts";
 import { ANCHOR_PUB } from "../vendor/hodl/core/anchor.ts";
@@ -742,6 +742,12 @@ export async function handle(req: http.IncomingMessage, res: http.ServerResponse
 
     return json(res, 404, { error: "no such route", route });
   } catch (e: any) {
+    // Too many replays already waiting: a lookup is turned away rather than
+    // queued behind a crowd (core/ledger.ts). Not a fault, so no ref and no log.
+    if (e instanceof FoldBusyError) {
+      res.setHeader("retry-after", String(e.retryAfterSeconds));
+      return json(res, 503, { error: e.message, retryAfter: e.retryAfterSeconds });
+    }
     // The client gets a reference, the operator gets the detail. An unhandled
     // error's message is written for whoever wrote the code -- file paths, env
     // names, library internals -- and none of that is owed to a stranger.

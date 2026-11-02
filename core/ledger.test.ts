@@ -12,7 +12,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { currentFold, bustFold, MAX_CONCURRENT_REPLAYS } from "./ledger.ts";
+import {
+  currentFold,
+  bustFold,
+  waitingReplays,
+  FoldBusyError,
+  MAX_CONCURRENT_REPLAYS,
+  MAX_WAITING_LOOKUPS,
+  MAX_WAITING_PAYMENTS,
+} from "./ledger.ts";
 import type { Fold } from "./fold.ts";
 
 /** A replay that records which accounts it was asked for and resolves when told. */
@@ -208,5 +216,165 @@ test("with force, an older fold finishing last does not overwrite the newer cach
     throw new Error("must be served from the cache");
   });
   assert.equal(cachedFold, newerFold, "the cache keeps the fold that started later");
+  bustFold();
+});
+
+/** Run `n` replays that hold every slot until released; returns their releases. */
+async function holdEverySlot(load: (accounts: string[]) => Promise<Fold>, prefix: string) {
+  const held = Array.from({ length: MAX_CONCURRENT_REPLAYS }, (_, i) =>
+    currentFold([`${prefix}${i}`], false, load)
+  );
+  await tick();
+  return held;
+}
+
+/** Release every replay, in order, until all the given folds have settled. */
+async function drain(releases: Array<() => void>, folds: Array<Promise<unknown>>) {
+  let done = 0;
+  const settled = Promise.allSettled(folds);
+  let finished = false;
+  settled.then(() => (finished = true));
+  while (!finished) {
+    while (done < releases.length) releases[done++]();
+    await tick();
+  }
+  return settled;
+}
+
+test("the lookup line is bounded: when it is full a lookup is refused at once, not queued", async () => {
+  bustFold();
+  const { load, calls, releases } = perCallLoad();
+  const held = await holdEverySlot(load, "nano_h");
+  const queued = Array.from({ length: MAX_WAITING_LOOKUPS }, (_, i) => currentFold([`nano_q${i}`], false, load));
+  await tick();
+  assert.deepEqual(waitingReplays(), { payment: 0, lookup: MAX_WAITING_LOOKUPS });
+
+  // Before the fix the 1001st caller just joined the end of an unbounded line.
+  await assert.rejects(currentFold(["nano_over"], false, load), (e: unknown) => {
+    assert.ok(e instanceof FoldBusyError);
+    assert.equal(e.priority, "lookup");
+    assert.ok(e.retryAfterSeconds > 0);
+    return true;
+  });
+  assert.deepEqual(waitingReplays(), { payment: 0, lookup: MAX_WAITING_LOOKUPS }, "a refusal takes no place");
+
+  await drain(releases, [...held, ...queued]);
+  assert.equal(calls.length, MAX_CONCURRENT_REPLAYS + MAX_WAITING_LOOKUPS);
+  assert.ok(!calls.some((c) => c[0] === "nano_over"), "the refused set was never replayed");
+
+  // And the refused set is not stuck in the Map: asking again later replays it.
+  const again = perCallLoad();
+  const later = currentFold(["nano_over"], false, again.load);
+  await tick();
+  again.releases[0]();
+  assert.deepEqual((await later).accounts, ["nano_over"]);
+  bustFold();
+});
+
+test("a payment check is never behind waiting lookups: it gets the next free slot", async () => {
+  bustFold();
+  const { load, calls, releases } = perCallLoad();
+  const held = await holdEverySlot(load, "nano_h");
+  const lookups = Array.from({ length: MAX_WAITING_LOOKUPS }, (_, i) => currentFold([`nano_q${i}`], false, load));
+  const payment = currentFold(["nano_payer"], false, load, "payment");
+  await tick();
+  assert.deepEqual(waitingReplays(), { payment: 1, lookup: MAX_WAITING_LOOKUPS });
+
+  releases[0]();
+  await tick();
+  assert.deepEqual(calls[MAX_CONCURRENT_REPLAYS], ["nano_payer"], "the payer's replay runs before any lookup");
+
+  await drain(releases, [...held, ...lookups, payment]);
+  assert.deepEqual((await payment).accounts, ["nano_payer"]);
+  bustFold();
+});
+
+test("a full lookup line does not refuse a payment check", async () => {
+  bustFold();
+  const { load, releases } = perCallLoad();
+  const held = await holdEverySlot(load, "nano_h");
+  const lookups = Array.from({ length: MAX_WAITING_LOOKUPS }, (_, i) => currentFold([`nano_q${i}`], false, load));
+  await assert.rejects(currentFold(["nano_x"], false, load), FoldBusyError);
+  const payment = currentFold(["nano_payer"], false, load, "payment");
+  await tick();
+  assert.equal(waitingReplays().payment, 1);
+  await drain(releases, [...held, ...lookups, payment]);
+  assert.deepEqual((await payment).accounts, ["nano_payer"]);
+  bustFold();
+});
+
+test("the payment line is bounded too", async () => {
+  bustFold();
+  const { load, releases } = perCallLoad();
+  const held = await holdEverySlot(load, "nano_h");
+  const payments = Array.from({ length: MAX_WAITING_PAYMENTS }, (_, i) =>
+    currentFold([`nano_p${i}`], false, load, "payment")
+  );
+  await assert.rejects(currentFold(["nano_p_over"], false, load, "payment"), (e: unknown) => {
+    assert.ok(e instanceof FoldBusyError);
+    assert.equal(e.priority, "payment");
+    return true;
+  });
+  await drain(releases, [...held, ...payments]);
+  bustFold();
+});
+
+test("a payment caller joining a waiting lookup replay moves it ahead of the other lookups", async () => {
+  bustFold();
+  const { load, calls, releases } = perCallLoad();
+  const held = await holdEverySlot(load, "nano_h");
+  const lookups = Array.from({ length: 3 }, (_, i) => currentFold([`nano_q${i}`], false, load));
+  // A stranger's GET /api/tokens?account=payer got there first, as a lookup.
+  const strangers = currentFold(["nano_payer"], false, load);
+  const payment = currentFold(["nano_payer"], false, load, "payment");
+  await tick();
+  assert.deepEqual(waitingReplays(), { payment: 1, lookup: 3 });
+
+  releases[0]();
+  await tick();
+  assert.deepEqual(calls[MAX_CONCURRENT_REPLAYS], ["nano_payer"]);
+  await drain(releases, [...held, ...lookups, strangers, payment]);
+  assert.equal(await strangers, await payment, "still one replay for the one set");
+  assert.equal(calls.filter((c) => c[0] === "nano_payer").length, 1);
+  bustFold();
+});
+
+test("bustFold keeps a replay that is still waiting for a slot: no duplicate replay, and it is cached", async () => {
+  bustFold();
+  const { load, calls, releases } = perCallLoad();
+  const held = await holdEverySlot(load, "nano_h");
+  const waitingFold = currentFold(["nano_w"], false, load);
+  await tick();
+  assert.equal(waitingReplays().lookup, 1);
+
+  bustFold();
+  // A caller after the bust joins the waiting replay; it has read nothing yet,
+  // so it is as fresh as a new one. Before the fix this queued a second replay.
+  const afterBust = currentFold(["nano_w"], false, load);
+  assert.deepEqual(waitingReplays(), { payment: 0, lookup: 1 });
+
+  await drain(releases, [...held, waitingFold, afterBust]);
+  assert.equal(await waitingFold, await afterBust);
+  assert.equal(calls.filter((c) => c[0] === "nano_w").length, 1, "one replay of nano_w, not two");
+
+  // It started after the bust, so it is the cached answer.
+  const cachedFold = await currentFold(["nano_w"], false, async () => {
+    throw new Error("must be served from the cache");
+  });
+  assert.equal(cachedFold, await waitingFold);
+  bustFold();
+});
+
+test("bustFold still drops a replay that already started, even while others wait", async () => {
+  bustFold();
+  const { load, calls, releases } = perCallLoad();
+  const held = await holdEverySlot(load, "nano_h");
+  const waitingFold = currentFold(["nano_w"], false, load);
+  await tick();
+  bustFold();
+  // nano_h0 was running at the bust: asking again must not join it.
+  const again = currentFold(["nano_h0"], false, load);
+  await drain(releases, [...held, waitingFold, again]);
+  assert.equal(calls.filter((c) => c[0] === "nano_h0").length, 2);
   bustFold();
 });

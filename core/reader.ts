@@ -37,13 +37,13 @@ export class NodeReader implements ChainReader {
   }
 
   async tokenOpApplied(tokenId: string, carrierHash: string) {
-    const f = await currentFold(this.extraAccounts);
+    const f = await currentFold(this.extraAccounts, false, undefined, "payment");
     return opApplied(f, tokenId, carrierHash);
   }
 
   /** Collateral behind a token, from this verifier's own replay. */
   async tokenBacking(tokenId: string): Promise<{ backing: bigint; circulating: bigint } | null> {
-    const f = await currentFold(this.extraAccounts);
+    const f = await currentFold(this.extraAccounts, false, undefined, "payment");
     const s = stateOf(f, tokenId);
     if (!s.launched) return null;
     return { backing: backingOf(s), circulating: circulatingOf(s) };
@@ -51,7 +51,7 @@ export class NodeReader implements ChainReader {
 
   /** Token balance as this verifier computes it. For display, not verdicts. */
   async tokenBalance(tokenId: string, account: string): Promise<bigint> {
-    const f = await currentFold(this.extraAccounts);
+    const f = await currentFold(this.extraAccounts, false, undefined, "payment");
     return stateOf(f, tokenId).balances.get(account) ?? 0n;
   }
 }

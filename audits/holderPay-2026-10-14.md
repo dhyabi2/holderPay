@@ -11,9 +11,9 @@ $ npm ci && npm test                      # 51 passed, 0 failed
 $ node scripts/build-web.mjs              # rewrites web/pay.js byte-identically
 ```
 
-With this branch: **59 passed**, `build-web.mjs` still byte-identical (`core/ledger.ts`
+With this branch: **66 passed**, `build-web.mjs` still byte-identical (`core/ledger.ts`
 imports `node:fs` and is not in the browser bundle). 55 of those came with the first commit;
-the follow-up below added four more.
+the follow-ups below added four, then seven more.
 
 Every prior audit read the verdict as a *pure function* — policy, receipt, reader — and
 that reading is still sound. This run read the one input that function does not control:
@@ -154,6 +154,23 @@ Re-verified here rather than assumed: `npm test` 59 passed / 0 failed, and
 `acquireSlot`/`releaseSlot` is sound — a finishing replay hands its slot to the next waiter
 without decrementing, so `activeReplays` stays equal to the slots actually held, and the
 release sits in a `finally` so a throwing `load` cannot leak one.
+
+### Second follow-up — a bounded, two-lane waiting line
+
+Review at `5b82263` measured what the paragraph above conceded: the line behind the cap was
+unbounded FIFO, so after 1000 unauthenticated `GET /api/tokens?account=` lookups a payer's
+replay ran 1001st. Now the line has two lanes. `NodeReader` (the payment check behind
+`POST /api/verify` and `/api/access`) asks with priority `"payment"`, and every freed slot goes
+to that lane first; everything else is `"lookup"` by default, and that lane holds at most
+`MAX_WAITING_LOOKUPS` (8). A lookup that finds it full is refused at once with
+`FoldBusyError`, which the server answers as `503` with `Retry-After`, leaving nothing in
+the Map or the line. The payment lane is capped too (`MAX_WAITING_PAYMENTS`, 64) only so memory
+is bounded. A payment caller that joins a lookup replay still waiting moves it to its lane.
+
+`bustFold` no longer leaves the line out of step with the Map: it drops only replays that
+have started; one still waiting has read nothing, takes the generation current when it
+starts, and stays joinable, so a caller after the bust no longer queues a duplicate replay
+of the same set. `npm test` 66 passed / 0 failed.
 
 ## Could not verify
 
