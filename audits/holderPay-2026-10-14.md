@@ -1,0 +1,240 @@
+# holderPay — audit 2026-10-14
+
+Previous audit 2026-10-12 (`d05cb67`, a v1 `priceToken` that is not an integer). HEAD
+audited: `main` at `d05cb67`. Read under one question: can an agent pay in XNO (or in a
+token) with this today without being hurt?
+
+Baseline on `main`, before any change:
+
+```
+$ npm ci && npm test                      # 51 passed, 0 failed
+$ node scripts/build-web.mjs              # rewrites web/pay.js byte-identically
+```
+
+With this branch: **70 passed**, `build-web.mjs` still byte-identical (`core/ledger.ts`
+imports `node:fs` and is not in the browser bundle). 55 of those came with the first commit;
+the follow-ups below added four, then seven, then four more.
+
+Every prior audit read the verdict as a *pure function* — policy, receipt, reader — and
+that reading is still sound. This run read the one input that function does not control:
+**which accounts the reader actually replayed**, and who decides that when two buyers are
+checking out at the same time.
+
+## Checked
+
+- **`core/verify.ts` end to end**, unchanged by this branch. The receipt commits to the
+  policy id under the buyer's own signature, the payment is the receipt's `previous`, and
+  Nano's no-fork rule makes that pairing unique. Both lanes are still decided by what the
+  payment block *is* (`xnoLane` by the link's destination, `tokenLane` by a decoded
+  fragment pair whose two halves burn exactly 1 raw), never by what the caller claims.
+- **No float touches an amount.** Every quantity on both lanes is `bigint`. The AcceptAny
+  pro-rata `backedValue` (`verify.ts:321`) is integer division, which rounds against the
+  payer and so can only refuse, never grant short.
+- **Token ids agree across the two reader calls.** `assembleFrag` returns a lower-case id
+  (`fraglink.ts:28,134`), `opApplied` compares case-insensitively (`fold.ts:128`) and
+  `stateOf` lower-cases its key (`fold.ts:111`), so the `tokenOpApplied(assembled.tokenId)`
+  / `tokenBacking(paidId)` pair cannot read two different tokens.
+- **`POST /api/access`** still requires both a chain verdict and a signature by the paying
+  account over `authDigest(policyId, receipt, challenge)`, and the challenge is burned only
+  on success (`server/index.ts:722`), so a failed attempt does not consume an honest
+  payer's challenge.
+- **Secrets:** `.env.example` carries no value and `git grep -nE '[0-9a-fA-F]{64}'` over
+  the tree and over `git log -p` finds no key material. Unchanged.
+
+## Found and fixed — a fold in flight was handed to a caller that had asked a different question
+
+`core/fold.ts:46-52` states the rule this depends on:
+
+> An account that traded this token without ever touching any seed is invisible here, and
+> its ops are missing from the fold. That is conservative for payments — a missing buy
+> makes a payer look POORER, so it can cause a real payment to fail verification … Pass
+> the accounts you know about in `seeds`.
+
+That is exactly what the server does: both money routes read the buyer's account off the
+request and pass it down.
+
+```
+server/index.ts:700  POST /api/access  new NodeReader(body?.payer ? [String(body.payer)] : [])
+server/index.ts:674  POST /api/verify  new NodeReader(body?.payer ? [String(body.payer)] : [])
+core/reader.ts:40    tokenOpApplied -> currentFold(this.extraAccounts)
+```
+
+`currentFold` keyed its **cache** on that account set — and did not key the **in-flight
+promise** on it (`core/ledger.ts:57,63` on `main`):
+
+```ts
+let cached: { fold: Fold; key: string } | null = null;
+let inflight: Promise<Fold> | null = null;
+...
+  if (!force && cached && cached.key === key && ...) return cached.fold;
+  if (inflight) return inflight;            // <- no key compare
+```
+
+So whoever arrived while *any* fold was running received that fold, whatever accounts it
+covered. A fold takes a burst of RPC calls over up to 400 chains, so the window is seconds
+wide, and two buyers checking out in the same few seconds reach it — as does one buyer's
+page polling `/api/verify` while another request runs.
+
+The consequence lands on the token lane, after the money has moved. Buyer B's transfer is
+confirmed on chain, but the fold B is handed never replayed B's account, so
+`appliedByCarrier` has no entry for B's carrier block and `opApplied` falls through to its
+last branch (`fold.ts:131`):
+
+```
+{ applied: false, reason: "not present in this verifier's replay yet (unwatched account, or not yet confirmed)" }
+```
+
+`tokenLane` turns that into `fail: "token transfer is signed but did not apply in the
+ledger: …"` (`verify.ts:283`), `POST /api/access` answers **402 with that reason**, and a
+buyer who has paid is told their payment did not happen. It is refuse-only — a fold can
+only ever make a payer look poorer, never richer — so this is a real payment refused, not
+a fake one accepted.
+
+Measured, with the replay injected so no node is involved
+(`core/ledger.test.ts`, test 1 — buyer A's request starts the fold, buyer B's arrives
+while it runs):
+
+```
+not ok 1 - a fold in flight for one account set is not handed to a caller asking for another
+    Expected values to be strictly deep-equal:
+    + actual - expected
+      [
+    +   'nano_a'
+    -   'nano_b'
+      ]
+```
+
+Two further cases fall out of the same line. `bustFold()` — which `server/watch.ts:91`
+calls when the websocket reports a relevant block, and which `scripts/e2e.ts:82` calls for
+"a fresh replay each attempt: this is the real check, not a cache" — cleared `cached` and
+left `inflight` alone, so the next call was served a replay that had started *before* the
+block arrived, and that pre-bust replay then became the cached answer for everyone else.
+
+The fix keys the in-flight promise on the same account set the cache is keyed on, and has
+`bustFold` drop it:
+
+- two different account sets now cost two replays, which is the price of each caller
+  getting an answer to its own question;
+- two callers asking for the *same* accounts still share one replay — pinned by test 2,
+  which passes before and after, so the fix does not quietly drop the coalescing;
+- a fold that started before a bust is still returned to the caller that asked for it, but
+  a generation counter stops it becoming the cached answer for the next one.
+
+`currentFold` grew a third parameter, the replay function, defaulting to `fold`. Every one
+of its 18 callers is unchanged; it exists so the cache's rules can be tested without a
+node, which is the seam `foldAccounts(source, accounts)` already uses one level down.
+
+```
+$ node --experimental-strip-types --test core/ledger.test.ts   # without the fix
+# tests 4   # pass 1   # fail 3
+$ node --experimental-strip-types --test core/ledger.test.ts   # with it
+# tests 4   # pass 4   # fail 0
+$ npm test                                                     # 55 passed, 0 failed
+```
+
+### Follow-up on the same branch — `37d060f`, keyed by set rather than one slot
+
+The first commit held ONE in-flight entry, so interleaved callers for a, b, a started a
+third replay: the second `a` arrived after `b` had replaced it. `37d060f` keeps in-flight
+folds in a `Map` keyed by the account set, which costs two replays for that sequence rather
+than three, and adds two things the single slot had no room for:
+
+- **A cap of `MAX_CONCURRENT_REPLAYS` (4) distinct replays at once**, with the rest waiting
+  in arrival order and still joinable from the Map while they wait. Each replay is about 145
+  RPC calls and `GET /api/tokens` is unauthenticated, so this bounds the burst. It bounds the
+  burst and not the queue, which the comment there says plainly: distinct account sets come
+  from caller-supplied parameters, so `waiting` can still grow — one entry per distinct set,
+  which is strictly better than one unbounded 145-call replay per distinct set.
+- **A start stamp (`replaySeq`) on each replay**, so a fold that started earlier but finished
+  later cannot overwrite a newer cached one. Two `force` calls, or a slow set finishing after
+  a fast one, hit this.
+
+Re-verified here rather than assumed: `npm test` 59 passed / 0 failed, and
+`node scripts/build-web.mjs` leaves `web/pay.js` byte-identical. The baton-passing in
+`acquireSlot`/`releaseSlot` is sound — a finishing replay hands its slot to the next waiter
+without decrementing, so `activeReplays` stays equal to the slots actually held, and the
+release sits in a `finally` so a throwing `load` cannot leak one.
+
+### Second follow-up — a bounded, two-lane waiting line
+
+Review at `5b82263` measured what the paragraph above conceded: the line behind the cap was
+unbounded FIFO, so after 1000 unauthenticated `GET /api/tokens?account=` lookups a payer's
+replay ran 1001st. Now the line has two lanes. `NodeReader` (the payment check behind
+`POST /api/verify` and `/api/access`) asks with priority `"payment"`, and every freed slot goes
+to that lane first; everything else is `"lookup"` by default, and that lane holds at most
+`MAX_WAITING_LOOKUPS` (8). A lookup that finds it full is refused at once with
+`FoldBusyError`, which the server answers as `503` with `Retry-After`, leaving nothing in
+the Map or the line. The payment lane is capped too (`MAX_WAITING_PAYMENTS`, 64) only so memory
+is bounded. A payment caller that joins a lookup replay still waiting moves it to its lane.
+
+`bustFold` no longer leaves the line out of step with the Map: it drops only replays that
+have started; one still waiting has read nothing, takes the generation current when it
+starts, and stays joinable, so a caller after the bust no longer queues a duplicate replay
+of the same set. `npm test` 66 passed / 0 failed.
+
+## Could not verify
+
+- **Nothing was run against mainnet.** Every check here is offline: the suite's in-memory
+  ledger, the injected replay, and reading. The concurrency window is argued from the cost
+  of a fold (one `counterparties` call per seed plus a chain walk over up to 400 accounts)
+  rather than timed against the live endpoint, which this session cannot reach with a key.
+- **`POST /api/access` carries no rate limit**, while `POST /api/verify` does
+  (`server/index.ts:669`, 120/min/ip) and both do the same chain work plus a fold. So the
+  limit on the expensive path can be stepped around by calling the sibling route. Not
+  touched here — it is a second concern and adding a refusal to the route that hands over
+  the goods deserves its own branch and the owner's eye on the limit chosen.
+- **`verifyPayment`'s `now` parameter is unused.** The expiry check compares
+  `receipt.timestamp` against `policy.expires` (`verify.ts:112`), which is the right clock
+  — the buyer's signed receipt, not ours — but the parameter and its doc comment still
+  claim otherwise. Left alone: a rename moves no behaviour and the repo does not need the
+  noise.
+- **An expired offer is granted when the node reports `local_timestamp: 0`**, because the
+  expiry check is skipped unless `receipt.timestamp > 0` (`verify.ts:112`). A node that has
+  bootstrapped a block without a timestamp answers 0, so this is reachable. Whether to deny
+  on an unknown timestamp is a product call about offers that expire, not a defect to patch
+  quietly: flagged for the owner rather than changed.
+
+
+### Third follow-up — `32880b4`, the payment lane needed a door
+
+Review at `79e5ffa` found the lane split did not yet hold, because nothing stopped the
+crowd walking into the payment lane. `POST /api/verify` and `/api/access` put `body.payer`
+— any string at all — straight into a payment-priority replay, and every distinct string is
+a distinct account set, so a distinct replay. 68 requests carrying 68 invented payers filled
+the 4 running slots and all 64 waiting places, and a real buyer's own payment check was
+answered 503. `core/admission.ts` closes it with two rules that both fail closed: a payer
+must be a real Nano address, checksum included (400 otherwise), and each client address may
+put at most `PAYMENT_PAYERS_PER_CLIENT` (3) distinct payers into the payment lane per minute
+— past that the request still works, it just waits as a lookup. `POST /api/access`, which
+was unthrottled while every call could start a replay, now has a per-client limit like its
+sibling. `api/[...path].js` was rebuilt.
+
+Verified here first-hand rather than read:
+
+- **The gate accepts exactly what the real page sends.** `web/app.ts:606,642` send
+  `payer: keys.address`, the wallet's own address. Probed against `parsePayer`: that form is
+  accepted, `xrb_` and surrounding whitespace are normalised to it, a one-character change
+  (bad checksum) and a junk string are refused, a non-string is refused, and absent or empty
+  yields no seed — which is the pre-existing behaviour, so a client that sends no payer
+  verifies exactly as it did before. No honest payer is turned away by the new 400.
+- **A buyer polling their own check is never demoted.** With the budget spent, a repeat of an
+  already-admitted payer still returns `"payment"` (measured: three distinct payers get the
+  lane, the fourth and fifth become lookups, and the first one asked again is still
+  `payment`).
+- **The budget key cannot be forged.** `ip` is `req.socket.remoteAddress`
+  (`server/index.ts:418`), the TCP peer, not an `X-Forwarded-For` the caller controls.
+- **The serverless bundle was regenerated, not hand-edited.** Re-ran esbuild with
+  `build-vercel.mjs`'s exact options (including its `define` and `createRequire` banner) to a
+  throwaway outfile: 280,825 bytes against the committed 280,825, `diff` empty. Worth doing
+  because this repository has shipped a stale bundle before — `#7`, which re-shipped the
+  crash `#3` had fixed.
+- `npm test` 70 passed / 0 failed (was 66), and `build-web.mjs` still leaves `web/pay.js`
+  byte-identical.
+
+**One caveat, recorded rather than patched.** The budget is per `remoteAddress`, so buyers
+sharing one egress — a corporate NAT, a proxy, several agents on one host — share one budget
+of three. The fourth distinct wallet in a minute waits as a lookup, and a full lookup lane is
+refused with `503` and `Retry-After`. That is slower service under shared egress, never a
+false verdict: nothing on this path can turn into "your payment did not apply". Raising the
+budget or keying it on something better than an IP is a judgement about the shop's traffic,
+not a defect, so it is left for the owner.
