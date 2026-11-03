@@ -11,9 +11,9 @@ $ npm ci && npm test                      # 51 passed, 0 failed
 $ node scripts/build-web.mjs              # rewrites web/pay.js byte-identically
 ```
 
-With this branch: **66 passed**, `build-web.mjs` still byte-identical (`core/ledger.ts`
+With this branch: **70 passed**, `build-web.mjs` still byte-identical (`core/ledger.ts`
 imports `node:fs` and is not in the browser bundle). 55 of those came with the first commit;
-the follow-ups below added four, then seven more.
+the follow-ups below added four, then seven, then four more.
 
 Every prior audit read the verdict as a *pure function* — policy, receipt, reader — and
 that reading is still sound. This run read the one input that function does not control:
@@ -193,3 +193,48 @@ of the same set. `npm test` 66 passed / 0 failed.
   bootstrapped a block without a timestamp answers 0, so this is reachable. Whether to deny
   on an unknown timestamp is a product call about offers that expire, not a defect to patch
   quietly: flagged for the owner rather than changed.
+
+
+### Third follow-up — `32880b4`, the payment lane needed a door
+
+Review at `79e5ffa` found the lane split did not yet hold, because nothing stopped the
+crowd walking into the payment lane. `POST /api/verify` and `/api/access` put `body.payer`
+— any string at all — straight into a payment-priority replay, and every distinct string is
+a distinct account set, so a distinct replay. 68 requests carrying 68 invented payers filled
+the 4 running slots and all 64 waiting places, and a real buyer's own payment check was
+answered 503. `core/admission.ts` closes it with two rules that both fail closed: a payer
+must be a real Nano address, checksum included (400 otherwise), and each client address may
+put at most `PAYMENT_PAYERS_PER_CLIENT` (3) distinct payers into the payment lane per minute
+— past that the request still works, it just waits as a lookup. `POST /api/access`, which
+was unthrottled while every call could start a replay, now has a per-client limit like its
+sibling. `api/[...path].js` was rebuilt.
+
+Verified here first-hand rather than read:
+
+- **The gate accepts exactly what the real page sends.** `web/app.ts:606,642` send
+  `payer: keys.address`, the wallet's own address. Probed against `parsePayer`: that form is
+  accepted, `xrb_` and surrounding whitespace are normalised to it, a one-character change
+  (bad checksum) and a junk string are refused, a non-string is refused, and absent or empty
+  yields no seed — which is the pre-existing behaviour, so a client that sends no payer
+  verifies exactly as it did before. No honest payer is turned away by the new 400.
+- **A buyer polling their own check is never demoted.** With the budget spent, a repeat of an
+  already-admitted payer still returns `"payment"` (measured: three distinct payers get the
+  lane, the fourth and fifth become lookups, and the first one asked again is still
+  `payment`).
+- **The budget key cannot be forged.** `ip` is `req.socket.remoteAddress`
+  (`server/index.ts:418`), the TCP peer, not an `X-Forwarded-For` the caller controls.
+- **The serverless bundle was regenerated, not hand-edited.** Re-ran esbuild with
+  `build-vercel.mjs`'s exact options (including its `define` and `createRequire` banner) to a
+  throwaway outfile: 280,825 bytes against the committed 280,825, `diff` empty. Worth doing
+  because this repository has shipped a stale bundle before — `#7`, which re-shipped the
+  crash `#3` had fixed.
+- `npm test` 70 passed / 0 failed (was 66), and `build-web.mjs` still leaves `web/pay.js`
+  byte-identical.
+
+**One caveat, recorded rather than patched.** The budget is per `remoteAddress`, so buyers
+sharing one egress — a corporate NAT, a proxy, several agents on one host — share one budget
+of three. The fourth distinct wallet in a minute waits as a lookup, and a full lookup lane is
+refused with `503` and `Retry-After`. That is slower service under shared egress, never a
+false verdict: nothing on this path can turn into "your payment did not apply". Raising the
+budget or keying it on something better than an IP is a judgement about the shop's traffic,
+not a defect, so it is left for the owner.
