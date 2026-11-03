@@ -30,6 +30,7 @@ import { verifyPayment, lanesOf, type Verdict } from "../core/verify.ts";
 import { memoLink, authDigest, verifyAuth, grantId } from "../core/proof.ts";
 import { addressToPub, isNanoAddress } from "../core/block.ts";
 import { NodeReader } from "../core/reader.ts";
+import { parsePayer, PaymentAdmission } from "../core/admission.ts";
 import { currentFold, stateOf, FoldBusyError } from "../core/ledger.ts";
 import { tokenList, viewToken, type SortKey, type TokenLabels } from "../core/valuation.ts";
 import { planSwap, quoteBuy } from "../core/swap.ts";
@@ -182,6 +183,8 @@ async function awaitWorkSlot(ip: string, res: http.ServerResponse): Promise<Work
 // burning the RPC quota. In-memory, so it resets on restart and does
 // not span instances -- adequate for one box, not for a fleet.
 const hits = new Map<string, { n: number; until: number }>();
+// POST /api/access per client per minute. A buyer claims once per receipt.
+const ACCESS_PER_MIN = 30;
 function rateLimit(key: string, max: number, windowMs: number): boolean {
   const now = Date.now();
   const h = hits.get(key);
@@ -192,6 +195,10 @@ function rateLimit(key: string, max: number, windowMs: number): boolean {
   h.n++;
   return h.n <= max;
 }
+
+// Who gets the payment lane of the fold queue: a validated payer, and at most a
+// few distinct payers per client per minute (core/admission.ts says why).
+const paymentAdmission = new PaymentAdmission();
 
 // Catalog writes are shop ADMINISTRATION, not part of the trust model: no
 // grant depends on them, and a forged offer cannot mint access for anyone.
@@ -672,7 +679,9 @@ export async function handle(req: http.IncomingMessage, res: http.ServerResponse
       if (!policy) return json(res, 400, { error });
       const receipt = String(body?.receipt ?? "");
 
-      const reader = new NodeReader(body?.payer ? [String(body.payer)] : []);
+      const payer = parsePayer(body?.payer);
+      if (!payer.ok) return json(res, 400, { error: payer.error });
+      const reader = new NodeReader(payer.accounts, paymentAdmission.priority(ip, payer.accounts));
       const verdict = await verifyPayment(policy, receipt, reader);
 
       // The honest-server tamper demo. A real attacker would not add a query
@@ -698,7 +707,12 @@ export async function handle(req: http.IncomingMessage, res: http.ServerResponse
     // signature from the paying account over a fresh challenge, so a bystander
     // who merely read the receipt hash off the ledger cannot claim the grant.
     if (route === "POST /api/access") {
+      // Unthrottled before: every call can start a ledger replay, so it gets
+      // a per-client budget, as /api/verify has.
+      if (!rateLimit(`access:${ip}`, ACCESS_PER_MIN, 60_000)) return json(res, 429, { error: "slow down" });
       const body = await readBody(req);
+      const payer = parsePayer(body?.payer);
+      if (!payer.ok) return json(res, 400, { error: payer.error });
       const listing = catalog.get(String(body?.policyId ?? ""));
       if (!listing) return json(res, 404, { error: "unknown policy" });
       const receipt = String(body?.receipt ?? "");
@@ -707,7 +721,7 @@ export async function handle(req: http.IncomingMessage, res: http.ServerResponse
 
       if (!challengeValid(challenge)) return json(res, 400, { error: "challenge expired -- request a new one" });
 
-      const reader = new NodeReader(body?.payer ? [String(body.payer)] : []);
+      const reader = new NodeReader(payer.accounts, paymentAdmission.priority(ip, payer.accounts));
       const verdict = await verifyPayment(listing.policy, receipt, reader);
       if (!verdict.granted) return json(res, 402, { error: verdict.reason, verdict });
 

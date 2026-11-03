@@ -6,7 +6,7 @@
 
 import { getBlocks } from "./chain.ts";
 import type { ChainReader, VerifiedBlock } from "./block.ts";
-import { currentFold, stateOf, opApplied } from "./ledger.ts";
+import { currentFold, stateOf, opApplied, type FoldPriority } from "./ledger.ts";
 import { backingOf, circulatingOf } from "./valuation.ts";
 
 export class NodeReader implements ChainReader {
@@ -15,9 +15,14 @@ export class NodeReader implements ChainReader {
   // one more. Re-fetching the same hash within a call is pure waste.
   private memo = new Map<string, VerifiedBlock | null>();
   private extraAccounts: string[];
+  // Which lane of the fold queue this reader's replays wait in. "lookup" unless
+  // the caller has decided otherwise: the server grants "payment" only to a
+  // validated payer within its per-client budget (core/admission.ts).
+  private priority: FoldPriority;
 
-  constructor(extraAccounts: string[] = []) {
+  constructor(extraAccounts: string[] = [], priority: FoldPriority = "lookup") {
     this.extraAccounts = extraAccounts;
+    this.priority = priority;
   }
 
   async getBlock(hash: string): Promise<VerifiedBlock | null> {
@@ -37,13 +42,13 @@ export class NodeReader implements ChainReader {
   }
 
   async tokenOpApplied(tokenId: string, carrierHash: string) {
-    const f = await currentFold(this.extraAccounts, false, undefined, "payment");
+    const f = await currentFold(this.extraAccounts, false, undefined, this.priority);
     return opApplied(f, tokenId, carrierHash);
   }
 
   /** Collateral behind a token, from this verifier's own replay. */
   async tokenBacking(tokenId: string): Promise<{ backing: bigint; circulating: bigint } | null> {
-    const f = await currentFold(this.extraAccounts, false, undefined, "payment");
+    const f = await currentFold(this.extraAccounts, false, undefined, this.priority);
     const s = stateOf(f, tokenId);
     if (!s.launched) return null;
     return { backing: backingOf(s), circulating: circulatingOf(s) };
@@ -51,7 +56,7 @@ export class NodeReader implements ChainReader {
 
   /** Token balance as this verifier computes it. For display, not verdicts. */
   async tokenBalance(tokenId: string, account: string): Promise<bigint> {
-    const f = await currentFold(this.extraAccounts, false, undefined, "payment");
+    const f = await currentFold(this.extraAccounts, false, undefined, this.priority);
     return stateOf(f, tokenId).balances.get(account) ?? 0n;
   }
 }

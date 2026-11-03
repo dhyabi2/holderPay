@@ -79,8 +79,8 @@ export async function fold(extraAccounts: string[] = []): Promise<Fold> {
 // another replay.
 //
 // The waiting line is bounded and has two lanes. A replay asked for by a payment
-// check (POST /api/verify and /api/access, through NodeReader) waits in the
-// "payment" lane, and every free slot goes to that lane first, so a payer is
+// check (POST /api/verify and /api/access, through NodeReader) for a validated
+// payer within its client's budget (core/admission.ts) waits in the "payment" lane, and every free slot goes to that lane first, so a payer is
 // never behind a crowd of lookups. Everything else -- GET /api/tokens, /api/token
 // and /api/quote, which anyone can call with any account -- waits in the
 // "lookup" lane, which holds at most MAX_WAITING_LOOKUPS; when it is full the

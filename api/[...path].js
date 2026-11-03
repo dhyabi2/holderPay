@@ -5556,26 +5556,86 @@ async function fold(extraAccounts = []) {
   const accounts = (await watchSet(source, seeds(extraAccounts))).filter((a) => a !== anchor);
   return foldAccounts(source, accounts);
 }
+var MAX_CONCURRENT_REPLAYS = 4;
+var MAX_WAITING_LOOKUPS = 8;
+var MAX_WAITING_PAYMENTS = 64;
+var FOLD_BUSY_RETRY_AFTER_S = 5;
+var FoldBusyError = class extends Error {
+  retryAfterSeconds = FOLD_BUSY_RETRY_AFTER_S;
+  priority;
+  constructor(priority) {
+    super(`too many ledger replays waiting (${priority}); try again shortly`);
+    this.name = "FoldBusyError";
+    this.priority = priority;
+  }
+};
 var cached = null;
-var inflight = null;
+var inflight = /* @__PURE__ */ new Map();
+var generation = 0;
+var replaySeq = 0;
 var FOLD_TTL_MS = 4e3;
-async function currentFold(extraAccounts = [], force = false) {
+var activeReplays = 0;
+var waiting = { payment: [], lookup: [] };
+var LANE_CAP = {
+  payment: MAX_WAITING_PAYMENTS,
+  lookup: MAX_WAITING_LOOKUPS
+};
+function releaseSlot() {
+  const next = waiting.payment.shift() ?? waiting.lookup.shift();
+  if (next) next.resolve();
+  else activeReplays -= 1;
+}
+function promote(w) {
+  const i = waiting.lookup.indexOf(w);
+  if (i === -1) return;
+  waiting.lookup.splice(i, 1);
+  w.priority = "payment";
+  waiting.payment.push(w);
+}
+async function currentFold(extraAccounts = [], force = false, load2 = fold, priority = "lookup") {
   const key = [...extraAccounts].sort().join(",");
   if (!force && cached && cached.key === key && Date.now() - cached.fold.at < FOLD_TTL_MS) return cached.fold;
-  if (inflight) return inflight;
-  inflight = (async () => {
+  const running = inflight.get(key);
+  if (!force && running) {
+    if (priority === "payment" && running.waiter) promote(running.waiter);
+    return running.promise;
+  }
+  let waiter = null;
+  let wait = null;
+  if (activeReplays < MAX_CONCURRENT_REPLAYS) {
+    activeReplays += 1;
+  } else {
+    if (waiting[priority].length >= LANE_CAP[priority]) throw new FoldBusyError(priority);
+    wait = new Promise((resolve5) => {
+      waiter = { priority, resolve: resolve5 };
+    });
+    waiting[priority].push(waiter);
+  }
+  const entry = { key, promise: null, waiter };
+  inflight.set(key, entry);
+  entry.promise = (async () => {
     try {
-      const f = await fold(extraAccounts);
-      cached = { fold: f, key };
-      return f;
+      if (wait) await wait;
+      entry.waiter = null;
+      try {
+        const startedAt = generation;
+        const seq = ++replaySeq;
+        const f = await load2(extraAccounts);
+        if (startedAt === generation && !(cached && cached.seq > seq)) cached = { fold: f, key, seq };
+        return f;
+      } finally {
+        releaseSlot();
+      }
     } finally {
-      inflight = null;
+      if (inflight.get(key) === entry) inflight.delete(key);
     }
   })();
-  return inflight;
+  return entry.promise;
 }
 function bustFold() {
   cached = null;
+  for (const [key, entry] of inflight) if (!entry.waiter) inflight.delete(key);
+  generation += 1;
 }
 
 // core/valuation.ts
@@ -5654,8 +5714,13 @@ var NodeReader = class {
   // one more. Re-fetching the same hash within a call is pure waste.
   memo = /* @__PURE__ */ new Map();
   extraAccounts;
-  constructor(extraAccounts = []) {
+  // Which lane of the fold queue this reader's replays wait in. "lookup" unless
+  // the caller has decided otherwise: the server grants "payment" only to a
+  // validated payer within its per-client budget (core/admission.ts).
+  priority;
+  constructor(extraAccounts = [], priority = "lookup") {
     this.extraAccounts = extraAccounts;
+    this.priority = priority;
   }
   async getBlock(hash) {
     const key = (hash ?? "").toUpperCase();
@@ -5672,28 +5737,70 @@ var NodeReader = class {
     for (const h of want) this.memo.set(h, got.get(h) ?? null);
   }
   async tokenOpApplied(tokenId, carrierHash) {
-    const f = await currentFold(this.extraAccounts);
+    const f = await currentFold(this.extraAccounts, false, void 0, this.priority);
     return opApplied(f, tokenId, carrierHash);
   }
   /** Collateral behind a token, from this verifier's own replay. */
   async tokenBacking(tokenId) {
-    const f = await currentFold(this.extraAccounts);
+    const f = await currentFold(this.extraAccounts, false, void 0, this.priority);
     const s = stateOf(f, tokenId);
     if (!s.launched) return null;
     return { backing: backingOf(s), circulating: circulatingOf(s) };
   }
   /** Token balance as this verifier computes it. For display, not verdicts. */
   async tokenBalance(tokenId, account) {
-    const f = await currentFold(this.extraAccounts);
+    const f = await currentFold(this.extraAccounts, false, void 0, this.priority);
     return stateOf(f, tokenId).balances.get(account) ?? 0n;
   }
 };
 
+// core/admission.ts
+var nanocurrency12 = __toESM(require_nanocurrency_cjs(), 1);
+function parsePayer(raw) {
+  if (raw === void 0 || raw === null || raw === "") return { ok: true, accounts: [] };
+  if (typeof raw !== "string") return { ok: false, error: "payer must be a Nano address" };
+  const a = raw.trim().replace(/^xrb_/, "nano_");
+  if (a.length > 70 || !nanocurrency12.checkAddress(a)) {
+    return { ok: false, error: "payer is not a valid Nano address (bad format or checksum)" };
+  }
+  return { ok: true, accounts: [a] };
+}
+var PAYMENT_PAYERS_PER_CLIENT = 3;
+var PAYMENT_WINDOW_MS = 6e4;
+var MAX_TRACKED_CLIENTS = 1e4;
+var PaymentAdmission = class {
+  seen = /* @__PURE__ */ new Map();
+  perClient;
+  windowMs;
+  constructor(perClient = PAYMENT_PAYERS_PER_CLIENT, windowMs = PAYMENT_WINDOW_MS) {
+    this.perClient = perClient;
+    this.windowMs = windowMs;
+  }
+  /** The lane this client's replay of `accounts` may wait in. */
+  priority(client, accounts, now = Date.now()) {
+    const key = [...accounts].sort().join(",");
+    let h = this.seen.get(client);
+    if (!h || now > h.until) {
+      this.seen.delete(client);
+      if (this.seen.size >= MAX_TRACKED_CLIENTS) {
+        const oldest = this.seen.keys().next().value;
+        if (oldest !== void 0) this.seen.delete(oldest);
+      }
+      h = { payers: /* @__PURE__ */ new Set(), until: now + this.windowMs };
+      this.seen.set(client, h);
+    }
+    if (h.payers.has(key)) return "payment";
+    if (h.payers.size >= this.perClient) return "lookup";
+    h.payers.add(key);
+    return "payment";
+  }
+};
+
 // core/swap.ts
-var nanocurrency13 = __toESM(require_nanocurrency_cjs(), 1);
+var nanocurrency14 = __toESM(require_nanocurrency_cjs(), 1);
 
 // core/wallet.ts
-var nanocurrency12 = __toESM(require_nanocurrency_cjs(), 1);
+var nanocurrency13 = __toESM(require_nanocurrency_cjs(), 1);
 var XNO2 = 10n ** 30n;
 
 // core/swap.ts
@@ -6036,6 +6143,7 @@ async function awaitWorkSlot(ip, res) {
   }
 }
 var hits = /* @__PURE__ */ new Map();
+var ACCESS_PER_MIN = 30;
 function rateLimit(key, max, windowMs) {
   const now = Date.now();
   const h = hits.get(key);
@@ -6046,6 +6154,7 @@ function rateLimit(key, max, windowMs) {
   h.n++;
   return h.n <= max;
 }
+var paymentAdmission = new PaymentAdmission();
 var ADMIN_TOKEN = env("ADMIN_TOKEN");
 var DEV_OPEN_CATALOG = env("HOLDERPAY_DEV") === "1";
 var ALLOW_FORGE = env("HOLDERPAY_ALLOW_FORGE") === "1";
@@ -6343,7 +6452,9 @@ async function handle(req, res) {
       const { policy, error } = resolvePolicy(body);
       if (!policy) return json(res, 400, { error });
       const receipt = String(body?.receipt ?? "");
-      const reader = new NodeReader(body?.payer ? [String(body.payer)] : []);
+      const payer = parsePayer(body?.payer);
+      if (!payer.ok) return json(res, 400, { error: payer.error });
+      const reader = new NodeReader(payer.accounts, paymentAdmission.priority(ip, payer.accounts));
       const verdict = await verifyPayment(policy, receipt, reader);
       if (url.searchParams.get("forge") === "1" && (DEV_OPEN_CATALOG || ALLOW_FORGE)) {
         const forged = {
@@ -6359,14 +6470,17 @@ async function handle(req, res) {
       return json(res, 200, { verdict });
     }
     if (route === "POST /api/access") {
+      if (!rateLimit(`access:${ip}`, ACCESS_PER_MIN, 6e4)) return json(res, 429, { error: "slow down" });
       const body = await readBody(req);
+      const payer = parsePayer(body?.payer);
+      if (!payer.ok) return json(res, 400, { error: payer.error });
       const listing = get3(String(body?.policyId ?? ""));
       if (!listing) return json(res, 404, { error: "unknown policy" });
       const receipt = String(body?.receipt ?? "");
       const challenge = String(body?.challenge ?? "");
       const signature = String(body?.signature ?? "");
       if (!challengeValid(challenge)) return json(res, 400, { error: "challenge expired -- request a new one" });
-      const reader = new NodeReader(body?.payer ? [String(body.payer)] : []);
+      const reader = new NodeReader(payer.accounts, paymentAdmission.priority(ip, payer.accounts));
       const verdict = await verifyPayment(listing.policy, receipt, reader);
       if (!verdict.granted) return json(res, 402, { error: verdict.reason, verdict });
       const pub = addressToPub(verdict.payer);
@@ -6396,6 +6510,10 @@ async function handle(req, res) {
     }
     return json(res, 404, { error: "no such route", route });
   } catch (e) {
+    if (e instanceof FoldBusyError) {
+      res.setHeader("retry-after", String(e.retryAfterSeconds));
+      return json(res, 503, { error: e.message, retryAfter: e.retryAfterSeconds });
+    }
     const ref = crypto2.randomBytes(6).toString("hex");
     console.error(`[${ref}] ${route} failed:`, e);
     return json(res, 500, { error: "something went wrong on this server", ref });
